@@ -33,8 +33,8 @@ final class RemoteControlTest: XCTestCase {
 
     override func setUpWithError() throws {
         continueAfterFailure = false
-        acceptLocalNetworkPromptIfNeeded()
         try startServer()
+        acceptLocalNetworkPromptIfNeeded()
     }
 
     override func tearDownWithError() throws {
@@ -46,6 +46,9 @@ final class RemoteControlTest: XCTestCase {
     /// command's UI work here, and fires due periodic screenshots between
     /// commands. Runs until a client hits `/api/exit` or the session cap.
     func testRemoteControl() throws {
+        // enter background
+        XCUIDevice.shared.press(.home)
+        // loop
         let deadline = Date().addingTimeInterval(Config.maxSessionSeconds)
         while !broker.shouldExit, Date() < deadline {
             if let command = broker.next(timeout: 0.2) {
@@ -253,24 +256,58 @@ final class RemoteControlTest: XCTestCase {
 
     /// iOS gates LAN access behind a one-time Local Network privacy prompt that
     /// the XCTRunner never answers on its own. Bring the runner forward, generate
-    /// outbound LAN traffic to our own server to raise the prompt, then accept
-    /// it; the choice is cached for subsequent launches.
+    /// outbound LAN traffic to raise the prompt, then accept it; the choice is
+    /// cached for subsequent launches.
+    ///
+    /// The prompt only fires on *outbound* local-network traffic, and a single
+    /// connection to our own unicast IP is an unreliable trigger. Apple's
+    /// guidance is to send an IPv4 UDP broadcast, so we do that (plus a poke at
+    /// our now-live server) and retry in a short loop while polling for the alert.
     private func acceptLocalNetworkPromptIfNeeded() {
         XCUIApplication(bundleIdentifier: Config.runnerBundleIdentifier).activate()
+
+        let deadline = Date().addingTimeInterval(8)
+        repeat {
+            triggerLocalNetworkTraffic()
+
+            let alert = springboard.alerts.firstMatch
+            if alert.waitForExistence(timeout: 2) {
+                for label in ["Allow", "允许", "允許"] {
+                    let button = alert.buttons[label]
+                    if button.exists { return button.tap() }
+                }
+                return alert.buttons.allElementsBoundByIndex.last?.tap() ?? ()
+            }
+        } while Date() < deadline
+    }
+
+    /// Emits outbound LAN traffic to provoke the Local Network privacy prompt:
+    /// an IPv4 UDP broadcast (Apple's recommended trigger) plus a request to our
+    /// own server over its unicast LAN address.
+    private func triggerLocalNetworkTraffic() {
+        let fd = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP)
+        if fd >= 0 {
+            var enabled: Int32 = 1
+            setsockopt(fd, SOL_SOCKET, SO_BROADCAST, &enabled, socklen_t(MemoryLayout<Int32>.size))
+
+            var addr = sockaddr_in()
+            addr.sin_family = sa_family_t(AF_INET)
+            addr.sin_port = Config.serverPort.bigEndian
+            addr.sin_addr.s_addr = in_addr_t(0xffff_ffff) // 255.255.255.255
+
+            let payload = Array("ping".utf8)
+            _ = withUnsafePointer(to: &addr) { pointer in
+                pointer.withMemoryRebound(to: sockaddr.self, capacity: 1) { sa in
+                    sendto(fd, payload, payload.count, 0, sa, socklen_t(MemoryLayout<sockaddr_in>.size))
+                }
+            }
+            close(fd)
+        }
 
         if let ip = primaryIPAddress(),
            let url = URL(string: "http://\(ip):\(Config.serverPort)/api/health") {
             URLSession.shared.dataTask(with: url) { _, _, _ in }.resume()
         }
-
-        let alert = springboard.alerts.firstMatch
-        guard alert.waitForExistence(timeout: 3) else { return }
-
-        for label in ["Allow", "允许", "允許"] {
-            let button = alert.buttons[label]
-            if button.exists { return button.tap() }
-        }
-        alert.buttons.allElementsBoundByIndex.last?.tap()
     }
 
     /// First IPv4 address on the primary Wi-Fi interface (en0).
