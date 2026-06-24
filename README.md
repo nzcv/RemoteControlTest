@@ -21,6 +21,7 @@ Parameters may be passed as query string values or in a JSON request body.
 | any | `/api/launch` | `bundleId` | Terminate (if running) and relaunch an app to the foreground |
 | any | `/api/activate` | `bundleId` | Foreground an app, launching it if it has exited |
 | any | `/api/terminate` | `bundleId` | Terminate an app |
+| GET | `/api/terminate/{bundleId}` | `bundleId` (path) | Terminate an app, with `bundleId` as a path segment |
 | GET | `/api/screenshot` | – | Capture one screenshot, returned as `image/png` |
 | any | `/api/screenshot/start` | `interval` (s, default `1`), `limit` (0 = unlimited) | Begin periodic screenshots |
 | any | `/api/screenshot/stop` | – | Stop periodic screenshots |
@@ -50,9 +51,12 @@ DEVICE_UDID=<udid> ./launch_with_xcodebuild.sh
 Example client calls:
 
 ```bash
-curl "http://<device-ip>:18200/api/health"
-curl "http://<device-ip>:18200/api/launch?bundleId=com.rm42.TrashDash"
-curl "http://<device-ip>:18200/api/screenshot" -o shot.png
-curl "http://<device-ip>:18200/api/screenshot/start?interval=2&limit=10"
-curl "http://<device-ip>:18200/api/exit"
+curl "http://192.168.1.5:18200/api/health"
+curl "http://192.168.1.5:18200/api/launch?bundleId=com.rm42.TrashDash"
+curl -X POST "http://192.168.1.5:18200/api/activate" -d '{"bundleId":"com.rm42.TrashDash"}' -H "Content-Type: application/json"
+curl -X POST "http://192.168.1.5:18200/api/terminate" -d '{"bundleId":"com.rm42.TrashDash"}' -H "Content-Type: application/json"
+curl "http://192.168.1.5:18200/api/terminate/com.rm42.TrashDash"
+curl "http://192.168.1.5:18200/api/screenshot" -o shot.png
+curl "http://192.168.1.5:18200/api/screenshot/start?interval=2&limit=10"
+curl "http://192.168.1.5:18200/api/exit"
 ```

@@ -16,6 +16,7 @@ import Swifter
 ///   *    /api/launch?bundleId=...                 (re)launch an app to foreground
 ///   *    /api/activate?bundleId=...               foreground an app (launch if dead)
 ///   *    /api/terminate?bundleId=...              terminate an app
+///   GET  /api/terminate/{bundleId}               terminate an app (path param)
 ///   GET  /api/screenshot                          capture one screenshot (PNG)
 ///   *    /api/screenshot/start?interval=1&limit=0 begin periodic screenshots
 ///   *    /api/screenshot/stop                     stop periodic screenshots
@@ -172,6 +173,9 @@ final class RemoteControlTest: XCTestCase {
         server["/api/terminate"] = { [weak self] request in
             self?.appCommand(request) { .terminate(bundleId: $0) } ?? .internalServerError
         }
+        server.GET["/api/terminate/:bundleId"] = { [weak self] request in
+            self?.appCommand(request) { .terminate(bundleId: $0) } ?? .internalServerError
+        }
         server["/api/screenshot"] = { [weak self] _ in
             guard let self else { return .internalServerError }
             return self.httpResponse(for: self.broker.submit(.screenshot))
@@ -208,9 +212,14 @@ final class RemoteControlTest: XCTestCase {
 
     // MARK: - Request / response helpers
 
-    /// Merges query parameters and a JSON request body into one lookup table.
+    /// Merges path placeholders, query parameters, and a JSON request body into
+    /// one lookup table. Path placeholders (e.g. `:bundleId`) are exposed under
+    /// their bare name (`bundleId`).
     private func params(_ request: HttpRequest) -> [String: String] {
         var result: [String: String] = [:]
+        for (key, value) in request.params {
+            result[key.hasPrefix(":") ? String(key.dropFirst()) : key] = value
+        }
         for (key, value) in request.queryParams { result[key] = value }
         if !request.body.isEmpty,
            let json = try? JSONSerialization.jsonObject(with: Data(request.body)) as? [String: Any] {
