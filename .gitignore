@@ -1,0 +1,21 @@
+# macOS / IDE
+.DS_Store
+*.log
+*.swp
+.idea/
+.vscode/
+
+# Xcode build/test output
+build/
+DerivedData*
+*.xcresult
+*.xctestrun
+*.dSYM/
+
+# Xcode user state
+*.xcuserstate
+xcuserdata/
+*.xcuserdatad/
+
+# Swift Package Manager
+.swiftpm/
