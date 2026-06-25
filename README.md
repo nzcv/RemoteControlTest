@@ -25,14 +25,19 @@ Parameters may be passed as query string values or in a JSON request body.
 | GET | `/api/screenshot` | – | Capture one screenshot, returned as `image/png` |
 | any | `/api/screenshot/start` | `interval` (s, default `1`), `limit` (0 = unlimited) | Begin periodic screenshots |
 | any | `/api/screenshot/stop` | – | Stop periodic screenshots |
-| GET | `/api/startMeasuring` | `bundleId` | Open an `XCTMemoryMetric` window on an app; other commands keep working while it is open |
-| GET | `/api/dtMeasuring/{seconds}` | `seconds` (path), `bundleId` | Open a measured window that auto-closes after `seconds` |
-| GET | `/api/stopMeasuring` | – | Close the measured window (footprint is harvested into the `.xcresult`) |
+| GET | `/api/measuring/start` | `bundleId` | Open an `XCTMemoryMetric` window on an app; other commands keep working while it is open |
+| GET | `/api/measuring/period/{seconds}` | `seconds` (path), `bundleId` | Open a measured window that auto-closes after `seconds` |
+| GET | `/api/measuring/stop` | – | Close the measured window (footprint is harvested into the `.xcresult`) |
+| GET | `/api/measuring/status` | – | Report the measuring `state`: `idle`, `started`, or `stopped` |
 | GET | `/api/exit` | – | Quit the runner |
 
 Periodic and on-demand screenshots are attached to the `.xcresult` bundle and
 also written to a `RemoteControlScreenshots` folder in the runner's temp
 directory on the device.
+
+`/api/measuring/status` reports a single `state` that walks through `idle`
+(before any measurement), `started` (while a measured window is open), and
+`stopped` (once a window has closed), e.g. `{"state":"started"}`.
 
 ## Environment variables
 
@@ -61,8 +66,9 @@ curl -X POST "http://192.168.1.5:18200/api/terminate" -d '{"bundleId":"com.rm42.
 curl "http://192.168.1.5:18200/api/terminate/com.rm42.TrashDash"
 curl "http://192.168.1.5:18200/api/screenshot" -o shot.png
 curl "http://192.168.1.5:18200/api/screenshot/start?interval=2&limit=10"
-curl "http://192.168.1.5:18200/api/startMeasuring?bundleId=com.rm42.TrashDash"
-curl "http://192.168.1.5:18200/api/dtMeasuring/10?bundleId=com.rm42.TrashDash"
-curl "http://192.168.1.5:18200/api/stopMeasuring"
+curl "http://192.168.1.5:18200/api/measuring/start?bundleId=com.rm42.TrashDash"
+curl "http://192.168.1.5:18200/api/measuring/period/10?bundleId=com.rm42.TrashDash"
+curl "http://192.168.1.5:18200/api/measuring/stop"
+curl "http://192.168.1.5:18200/api/measuring/status"
 curl "http://192.168.1.5:18200/api/exit"
 ```

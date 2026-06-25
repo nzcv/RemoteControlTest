@@ -20,9 +20,10 @@ import Swifter
 ///   GET  /api/screenshot                          capture one screenshot (PNG)
 ///   *    /api/screenshot/start?interval=1&limit=0 begin periodic screenshots
 ///   *    /api/screenshot/stop                     stop periodic screenshots
-///   GET  /api/startMeasuring?bundleId=...         open an XCTMemoryMetric window on an app
-///   GET  /api/dtMeasuring/{seconds}?bundleId=...  measure for a fixed duration, then auto-close
-///   GET  /api/stopMeasuring                       close the measured window
+///   GET  /api/measuring/start?bundleId=...        open an XCTMemoryMetric window on an app
+///   GET  /api/measuring/period/{seconds}?bundleId=...  measure for a fixed duration, then auto-close
+///   GET  /api/measuring/stop                      close the measured window
+///   GET  /api/measuring/status                    report the current measuring state
 ///   GET  /api/exit                                quit the runner
 ///
 /// `bundleId`, `interval`, and `limit` may be supplied as query parameters or
@@ -44,6 +45,10 @@ final class RemoteControlTest: XCTestCase {
     private var pendingMeasureDuration: TimeInterval?
     /// True while a `measure` window is open and draining the broker itself.
     private var measuringActive = false
+    /// Coarse measuring lifecycle reported by `/api/measuring/status`:
+    /// `idle` before any measurement, `started` while a window is open,
+    /// `stopped` after one closes.
+    private var measuringState = MeasuringState.idle
     /// Set by a `stopMeasuring` command to close the open window.
     private var measureStopRequested = false
 
@@ -96,8 +101,12 @@ final class RemoteControlTest: XCTestCase {
         options.iterationCount = 1
 
         measuringActive = true
+        measuringState = .started
         measureStopRequested = false
-        defer { measuringActive = false }
+        defer {
+            measuringActive = false
+            measuringState = .stopped
+        }
 
         measure(metrics: [XCTMemoryMetric(application: app)], options: options) {
             startMeasuring()
@@ -207,6 +216,13 @@ final class RemoteControlTest: XCTestCase {
                 ]))
             }
 
+        case .measuringStatus:
+            command.finish(.json([
+                "status": "ok",
+                "action": "measuringStatus",
+                "state": measuringState.rawValue,
+            ]))
+
         case .stopMeasuring:
             if measuringActive {
                 measureStopRequested = true
@@ -292,10 +308,10 @@ final class RemoteControlTest: XCTestCase {
             guard let self else { return .internalServerError }
             return self.httpResponse(for: self.broker.submit(.stopPeriodicScreenshots))
         }
-        server.GET["/api/startMeasuring"] = { [weak self] request in
+        server.GET["/api/measuring/start"] = { [weak self] request in
             self?.appCommand(request) { .startMeasuring(bundleId: $0) } ?? .internalServerError
         }
-        server.GET["/api/dtMeasuring/:seconds"] = { [weak self] request in
+        server.GET["/api/measuring/period/:seconds"] = { [weak self] request in
             guard let self else { return .internalServerError }
             let params = self.params(request)
             guard let bundleId = params["bundleId"], !bundleId.isEmpty else {
@@ -306,9 +322,13 @@ final class RemoteControlTest: XCTestCase {
             }
             return self.httpResponse(for: self.broker.submit(.timedMeasuring(bundleId: bundleId, seconds: seconds)))
         }
-        server.GET["/api/stopMeasuring"] = { [weak self] _ in
+        server.GET["/api/measuring/stop"] = { [weak self] _ in
             guard let self else { return .internalServerError }
             return self.httpResponse(for: self.broker.submit(.stopMeasuring))
+        }
+        server.GET["/api/measuring/status"] = { [weak self] _ in
+            guard let self else { return .internalServerError }
+            return self.httpResponse(for: self.broker.submit(.measuringStatus))
         }
         server["/api/exit"] = { [weak self] _ in
             guard let self else { return .internalServerError }
@@ -477,6 +497,7 @@ private final class Command {
         case startMeasuring(bundleId: String)
         case timedMeasuring(bundleId: String, seconds: TimeInterval)
         case stopMeasuring
+        case measuringStatus
         case exit
     }
 
@@ -544,6 +565,13 @@ private final class CommandBroker {
         condition.signal()
         condition.unlock()
     }
+}
+
+/// Coarse measuring lifecycle exposed by `/api/measuring/status`.
+private enum MeasuringState: String {
+    case idle
+    case started
+    case stopped
 }
 
 /// Mutable schedule for periodic screenshots, owned by the main thread.
