@@ -557,7 +557,7 @@ private struct PeriodicSchedule {
 // MARK: - Configuration
 
 private enum Config {
-    static var serverPort: in_port_t { env("SERVER_PORT").flatMap { in_port_t($0) } ?? 18200 }
+    static var serverPort: in_port_t { env("SERVER_PORT").flatMap { in_port_t($0) } ?? 18100 }
     static var testBundleIdentifier: String { env("TEST_BUNDLE_IDENTIFIER") ?? "com.idevice.RemoteControlTest" }
     static var runnerBundleIdentifier: String { env("RUNNER_BUNDLE_IDENTIFIER") ?? testBundleIdentifier + ".xctrunner" }
     static var maxSessionSeconds: TimeInterval { env("MAX_SESSION_SECONDS").flatMap(TimeInterval.init) ?? 6 * 60 * 60 }
