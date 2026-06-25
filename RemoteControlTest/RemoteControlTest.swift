@@ -20,6 +20,9 @@ import Swifter
 ///   GET  /api/screenshot                          capture one screenshot (PNG)
 ///   *    /api/screenshot/start?interval=1&limit=0 begin periodic screenshots
 ///   *    /api/screenshot/stop                     stop periodic screenshots
+///   GET  /api/startMeasuring?bundleId=...         open an XCTMemoryMetric window on an app
+///   GET  /api/dtMeasuring/{seconds}?bundleId=...  measure for a fixed duration, then auto-close
+///   GET  /api/stopMeasuring                       close the measured window
 ///   GET  /api/exit                                quit the runner
 ///
 /// `bundleId`, `interval`, and `limit` may be supplied as query parameters or
@@ -31,6 +34,18 @@ final class RemoteControlTest: XCTestCase {
 
     /// Periodic-screenshot schedule. Touched only on the main test thread.
     private var periodic: PeriodicSchedule?
+
+    /// An app whose memory the next loop iteration should open a measured
+    /// window on. Armed by a `startMeasuring` command, consumed on the main
+    /// test thread (XCTest's `measure` may only run there).
+    private var pendingMeasureApp: XCUIApplication?
+    /// Optional auto-close duration (seconds) for the pending window; `nil`
+    /// leaves it open until an explicit `stopMeasuring`.
+    private var pendingMeasureDuration: TimeInterval?
+    /// True while a `measure` window is open and draining the broker itself.
+    private var measuringActive = false
+    /// Set by a `stopMeasuring` command to close the open window.
+    private var measureStopRequested = false
 
     override func setUpWithError() throws {
         continueAfterFailure = false
@@ -56,6 +71,45 @@ final class RemoteControlTest: XCTestCase {
                 execute(command)
             }
             drivePeriodicScreenshots()
+            if let app = pendingMeasureApp {
+                let duration = pendingMeasureDuration
+                pendingMeasureApp = nil
+                pendingMeasureDuration = nil
+                runMeasurement(app: app, sessionDeadline: deadline, duration: duration)
+            }
+        }
+    }
+
+    /// Opens a single `XCTMemoryMetric` window on `app`.
+    ///
+    /// `measure` runs its block synchronously on this (main test) thread, so the
+    /// block itself keeps draining the broker — every other command, including
+    /// the `stopMeasuring` that closes the window, still executes while the
+    /// measurement is live.
+    ///
+    /// The window closes on the first of: an explicit `stopMeasuring`, the
+    /// optional fixed `duration` elapsing, the session deadline, or an exit
+    /// request.
+    private func runMeasurement(app: XCUIApplication, sessionDeadline: Date, duration: TimeInterval?) {
+        let options = XCTMeasureOptions()
+        options.invocationOptions = [.manuallyStart, .manuallyStop]
+        options.iterationCount = 1
+
+        measuringActive = true
+        measureStopRequested = false
+        defer { measuringActive = false }
+
+        measure(metrics: [XCTMemoryMetric(application: app)], options: options) {
+            startMeasuring()
+            let windowDeadline = duration.map { Date().addingTimeInterval($0) }
+            while !measureStopRequested, !broker.shouldExit, Date() < sessionDeadline {
+                if let windowDeadline, Date() >= windowDeadline { break }
+                if let command = broker.next(timeout: 0.2) {
+                    execute(command)
+                }
+                drivePeriodicScreenshots()
+            }
+            stopMeasuring()
         }
     }
 
@@ -117,6 +171,53 @@ final class RemoteControlTest: XCTestCase {
                 "action": "stopScreenshots",
                 "captured": captured,
             ]))
+
+        case .startMeasuring(let bundleId):
+            if measuringActive {
+                command.finish(.json([
+                    "status": "error",
+                    "action": "startMeasuring",
+                    "reason": "a measurement is already in progress",
+                ]))
+            } else {
+                pendingMeasureApp = XCUIApplication(bundleIdentifier: bundleId)
+                pendingMeasureDuration = nil
+                command.finish(.json([
+                    "status": "ok",
+                    "action": "startMeasuring",
+                    "bundleId": bundleId,
+                ]))
+            }
+
+        case .timedMeasuring(let bundleId, let seconds):
+            if measuringActive {
+                command.finish(.json([
+                    "status": "error",
+                    "action": "dtMeasuring",
+                    "reason": "a measurement is already in progress",
+                ]))
+            } else {
+                pendingMeasureApp = XCUIApplication(bundleIdentifier: bundleId)
+                pendingMeasureDuration = seconds
+                command.finish(.json([
+                    "status": "ok",
+                    "action": "dtMeasuring",
+                    "bundleId": bundleId,
+                    "seconds": seconds,
+                ]))
+            }
+
+        case .stopMeasuring:
+            if measuringActive {
+                measureStopRequested = true
+                command.finish(.json(["status": "ok", "action": "stopMeasuring"]))
+            } else {
+                command.finish(.json([
+                    "status": "error",
+                    "action": "stopMeasuring",
+                    "reason": "no measurement in progress",
+                ]))
+            }
 
         case .exit:
             command.finish(.json(["status": "ok", "action": "exit"]))
@@ -190,6 +291,24 @@ final class RemoteControlTest: XCTestCase {
         server["/api/screenshot/stop"] = { [weak self] _ in
             guard let self else { return .internalServerError }
             return self.httpResponse(for: self.broker.submit(.stopPeriodicScreenshots))
+        }
+        server.GET["/api/startMeasuring"] = { [weak self] request in
+            self?.appCommand(request) { .startMeasuring(bundleId: $0) } ?? .internalServerError
+        }
+        server.GET["/api/dtMeasuring/:seconds"] = { [weak self] request in
+            guard let self else { return .internalServerError }
+            let params = self.params(request)
+            guard let bundleId = params["bundleId"], !bundleId.isEmpty else {
+                return self.jsonResponse(["status": "error", "reason": "missing bundleId"], code: 400, reason: "Bad Request")
+            }
+            guard let seconds = params["seconds"].flatMap(Double.init), seconds > 0 else {
+                return self.jsonResponse(["status": "error", "reason": "invalid seconds"], code: 400, reason: "Bad Request")
+            }
+            return self.httpResponse(for: self.broker.submit(.timedMeasuring(bundleId: bundleId, seconds: seconds)))
+        }
+        server.GET["/api/stopMeasuring"] = { [weak self] _ in
+            guard let self else { return .internalServerError }
+            return self.httpResponse(for: self.broker.submit(.stopMeasuring))
         }
         server["/api/exit"] = { [weak self] _ in
             guard let self else { return .internalServerError }
@@ -355,6 +474,9 @@ private final class Command {
         case screenshot
         case startPeriodicScreenshots(interval: TimeInterval, limit: Int?)
         case stopPeriodicScreenshots
+        case startMeasuring(bundleId: String)
+        case timedMeasuring(bundleId: String, seconds: TimeInterval)
+        case stopMeasuring
         case exit
     }
 
