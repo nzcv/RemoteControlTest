@@ -1,5 +1,6 @@
 import XCTest
 import Foundation
+import UIKit
 import Swifter
 
 /// Turns an XCUITest runner into a long-lived, remotely controlled agent.
@@ -20,6 +21,7 @@ import Swifter
 ///   GET  /api/screenshot                          capture one screenshot (PNG)
 ///   *    /api/screenshot/start?interval=1&limit=0 begin periodic screenshots
 ///   *    /api/screenshot/stop                     stop periodic screenshots
+///   GET  /api/mjpeg?framerate=10&quality=25&scale=100  live MJPEG screen stream
 ///   GET  /api/startMeasuring?bundleId=...         open an XCTMemoryMetric window on an app
 ///   GET  /api/dtMeasuring/{seconds}?bundleId=...  measure for a fixed duration, then auto-close
 ///   GET  /api/stopMeasuring                       close the measured window
@@ -34,6 +36,17 @@ final class RemoteControlTest: XCTestCase {
 
     /// Periodic-screenshot schedule. Touched only on the main test thread.
     private var periodic: PeriodicSchedule?
+
+    /// MJPEG screen broadcaster, mirroring WDA's `FBMjpegServer`: the main
+    /// thread publishes JPEG frames at a configurable framerate while one or
+    /// more HTTP clients stream them as `multipart/x-mixed-replace`.
+    private let broadcaster = MJpegBroadcaster(settings: .init(
+        framerate: Config.mjpegFramerate,
+        quality: Config.mjpegQuality,
+        scalingFactor: Config.mjpegScalingFactor
+    ))
+    /// Next due time for an MJPEG frame capture. Touched only on the main thread.
+    private var nextMjpegFireDate = Date()
 
     /// An app whose memory the next loop iteration should open a measured
     /// window on. Armed by a `startMeasuring` command, consumed on the main
@@ -67,10 +80,11 @@ final class RemoteControlTest: XCTestCase {
         // loop
         let deadline = Date().addingTimeInterval(Config.maxSessionSeconds)
         while !broker.shouldExit, Date() < deadline {
-            if let command = broker.next(timeout: 0.2) {
+            if let command = broker.next(timeout: brokerPollTimeout()) {
                 execute(command)
             }
             drivePeriodicScreenshots()
+            driveMjpegStream()
             if let app = pendingMeasureApp {
                 let duration = pendingMeasureDuration
                 pendingMeasureApp = nil
@@ -104,10 +118,11 @@ final class RemoteControlTest: XCTestCase {
             let windowDeadline = duration.map { Date().addingTimeInterval($0) }
             while !measureStopRequested, !broker.shouldExit, Date() < sessionDeadline {
                 if let windowDeadline, Date() >= windowDeadline { break }
-                if let command = broker.next(timeout: 0.2) {
+                if let command = broker.next(timeout: brokerPollTimeout()) {
                     execute(command)
                 }
                 drivePeriodicScreenshots()
+                driveMjpegStream()
             }
             stopMeasuring()
         }
@@ -239,6 +254,40 @@ final class RemoteControlTest: XCTestCase {
         }
     }
 
+    /// How long the main loop should wait for the next command. While an MJPEG
+    /// client is connected we poll faster (half the frame interval) so the
+    /// producer can keep up with the requested framerate; otherwise we idle.
+    private func brokerPollTimeout() -> TimeInterval {
+        guard broadcaster.hasClients else { return 0.2 }
+        let framerate = Double(max(1, broadcaster.currentSettings.framerate))
+        return min(0.05, 1.0 / framerate / 2.0)
+    }
+
+    /// MJPEG producer (main thread). When at least one client is streaming and
+    /// the frame interval has elapsed, captures a JPEG frame and publishes it to
+    /// the broadcaster. Mirrors `FBMjpegServer.streamScreenshot`: no clients
+    /// means no capture, which keeps the device idle when nobody is watching.
+    private func driveMjpegStream() {
+        guard broadcaster.hasClients else { return }
+        let settings = broadcaster.currentSettings
+        let interval = 1.0 / Double(max(1, settings.framerate))
+        let now = Date()
+        guard now >= nextMjpegFireDate else { return }
+        nextMjpegFireDate = now.addingTimeInterval(interval)
+        if let frame = captureJpegFrame(quality: settings.quality, scalingFactor: settings.scalingFactor) {
+            broadcaster.publish(frame)
+        }
+    }
+
+    /// Captures the screen as a JPEG, optionally downscaled. Unlike
+    /// `captureScreenshot(tag:)` this does *not* attach to the `.xcresult`
+    /// bundle — at 10+ fps that would balloon the result bundle.
+    private func captureJpegFrame(quality: CGFloat, scalingFactor: CGFloat) -> Data? {
+        let image = XCUIScreen.main.screenshot().image
+        let source = scalingFactor < 1.0 ? image.scaledByPixelFactor(scalingFactor) : image
+        return source.jpegData(compressionQuality: quality)
+    }
+
     /// Captures a full-screen PNG, attaches it to the result bundle, and also
     /// writes it to a temp directory on the device for out-of-band retrieval.
     @discardableResult
@@ -292,6 +341,9 @@ final class RemoteControlTest: XCTestCase {
             guard let self else { return .internalServerError }
             return self.httpResponse(for: self.broker.submit(.stopPeriodicScreenshots))
         }
+        server["/api/mjpeg"] = { [weak self] request in
+            self?.mjpegStreamResponse(request) ?? .internalServerError
+        }
         server.GET["/api/startMeasuring"] = { [weak self] request in
             self?.appCommand(request) { .startMeasuring(bundleId: $0) } ?? .internalServerError
         }
@@ -327,6 +379,57 @@ final class RemoteControlTest: XCTestCase {
             return jsonResponse(["status": "error", "reason": "missing bundleId"], code: 400, reason: "Bad Request")
         }
         return httpResponse(for: broker.submit(make(bundleId)))
+    }
+
+    // MARK: - MJPEG stream
+
+    /// Opens a never-ending `multipart/x-mixed-replace` response and pumps the
+    /// broadcaster's latest JPEG frame to the client at the configured
+    /// framerate, mirroring WDA's `FBMjpegServer.sendScreenshot`. The producer
+    /// (`driveMjpegStream`) runs on the main thread; this writer runs on the
+    /// swifter connection thread and only forwards bytes.
+    ///
+    /// Optional query parameters update the *shared* producer settings (they
+    /// affect every connected client): `framerate` (1–60), `quality` (1–100
+    /// JPEG quality), and `scale` (1–100 percent downscale).
+    private func mjpegStreamResponse(_ request: HttpRequest) -> HttpResponse {
+        let lookup = params(request)
+        broadcaster.update(
+            framerate: lookup["framerate"].flatMap(Int.init).map { min(60, max(1, $0)) },
+            quality: lookup["quality"].flatMap(Double.init).map { CGFloat(min(100, max(1, $0)) / 100.0) },
+            scalingFactor: lookup["scale"].flatMap(Double.init).map { CGFloat(min(100, max(1, $0)) / 100.0) }
+        )
+
+        let boundary = "--BoundaryString"
+        let headers = [
+            "Content-Type": "multipart/x-mixed-replace; boundary=\(boundary)",
+            "Cache-Control": "no-cache, private",
+            "Pragma": "no-cache",
+            "Max-Age": "0",
+            "Expires": "0",
+            "Connection": "close",
+        ]
+
+        return .raw(200, "OK", headers) { [weak self] writer in
+            guard let self else { return }
+            self.broadcaster.clientConnected()
+            defer { self.broadcaster.clientDisconnected() }
+
+            var lastSequence: UInt64 = 0
+            while !self.broker.shouldExit {
+                let interval = 1.0 / Double(max(1, self.broadcaster.currentSettings.framerate))
+                guard let (frame, sequence) = self.broadcaster.snapshot(),
+                      sequence != lastSequence else {
+                    Thread.sleep(forTimeInterval: interval / 2.0)
+                    continue
+                }
+                lastSequence = sequence
+                let partHeader = "\(boundary)\r\nContent-Type: image/jpeg\r\nContent-Length: \(frame.count)\r\n\r\n"
+                try writer.write(Data(partHeader.utf8))
+                try writer.write(frame)
+                try writer.write(Data("\r\n\r\n".utf8))
+            }
+        }
     }
 
     // MARK: - Request / response helpers
@@ -554,6 +657,98 @@ private struct PeriodicSchedule {
     var nextFireDate = Date()
 }
 
+// MARK: - MJPEG broadcaster
+
+/// Thread-safe single-frame buffer shared between the main-thread producer
+/// (`driveMjpegStream`) and any number of HTTP streaming consumers. The
+/// producer overwrites the latest frame and bumps a sequence number; each
+/// consumer tracks the last sequence it sent so it only forwards new frames.
+///
+/// This is the local analogue of WDA's `FBMjpegServer`: capture, encode, and a
+/// fan-out to every connected client, with capture suppressed when nobody is
+/// listening.
+private final class MJpegBroadcaster {
+    struct Settings {
+        /// Frames per second the producer aims to capture (1–60).
+        var framerate: Int = 10
+        /// JPEG compression quality as a 0–1 fraction.
+        var quality: CGFloat = 0.25
+        /// Pixel downscale factor as a 0–1 fraction; `1` means no downscale.
+        var scalingFactor: CGFloat = 1.0
+    }
+
+    private let lock = NSLock()
+    private var latestFrame: Data?
+    private var sequence: UInt64 = 0
+    private var clientCount = 0
+    private var settings: Settings
+
+    init(settings: Settings) {
+        self.settings = settings
+    }
+
+    var hasClients: Bool {
+        lock.lock(); defer { lock.unlock() }
+        return clientCount > 0
+    }
+
+    var currentSettings: Settings {
+        lock.lock(); defer { lock.unlock() }
+        return settings
+    }
+
+    /// Updates shared producer settings; `nil` arguments are left unchanged.
+    func update(framerate: Int?, quality: CGFloat?, scalingFactor: CGFloat?) {
+        lock.lock(); defer { lock.unlock() }
+        if let framerate { settings.framerate = framerate }
+        if let quality { settings.quality = quality }
+        if let scalingFactor { settings.scalingFactor = scalingFactor }
+    }
+
+    func clientConnected() {
+        lock.lock(); clientCount += 1; lock.unlock()
+    }
+
+    func clientDisconnected() {
+        lock.lock(); clientCount = max(0, clientCount - 1); lock.unlock()
+    }
+
+    /// Producer side: store the freshly captured frame and advance the sequence.
+    func publish(_ frame: Data) {
+        lock.lock()
+        latestFrame = frame
+        sequence &+= 1
+        lock.unlock()
+    }
+
+    /// Consumer side: the latest frame and its sequence, or `nil` if none yet.
+    func snapshot() -> (Data, UInt64)? {
+        lock.lock(); defer { lock.unlock() }
+        guard let latestFrame else { return nil }
+        return (latestFrame, sequence)
+    }
+}
+
+// MARK: - Image helpers
+
+private extension UIImage {
+    /// Downscales the receiver by a 0–1 factor applied to its *pixel* size,
+    /// rendering at scale 1 so the JPEG matches the requested dimensions.
+    func scaledByPixelFactor(_ factor: CGFloat) -> UIImage {
+        guard factor > 0, factor < 1 else { return self }
+        let pixelSize = CGSize(width: size.width * scale, height: size.height * scale)
+        let target = CGSize(width: max(1, pixelSize.width * factor),
+                            height: max(1, pixelSize.height * factor))
+        let format = UIGraphicsImageRendererFormat.default()
+        format.scale = 1
+        format.opaque = true
+        let renderer = UIGraphicsImageRenderer(size: target, format: format)
+        return renderer.image { _ in
+            draw(in: CGRect(origin: .zero, size: target))
+        }
+    }
+}
+
 // MARK: - Configuration
 
 private enum Config {
@@ -561,6 +756,20 @@ private enum Config {
     static var testBundleIdentifier: String { env("TEST_BUNDLE_IDENTIFIER") ?? "com.idevice.RemoteControlTest" }
     static var runnerBundleIdentifier: String { env("RUNNER_BUNDLE_IDENTIFIER") ?? testBundleIdentifier + ".xctrunner" }
     static var maxSessionSeconds: TimeInterval { env("MAX_SESSION_SECONDS").flatMap(TimeInterval.init) ?? 6 * 60 * 60 }
+
+    /// MJPEG stream defaults, mirroring WDA's defaults (10 fps, 25% quality,
+    /// no downscale). Overridable per-connection via `/api/mjpeg` query params.
+    static var mjpegFramerate: Int {
+        env("MJPEG_FRAMERATE").flatMap(Int.init).map { min(60, max(1, $0)) } ?? 10
+    }
+    static var mjpegQuality: CGFloat {
+        let percent = env("MJPEG_QUALITY").flatMap(Double.init).map { min(100, max(1, $0)) } ?? 25
+        return CGFloat(percent / 100.0)
+    }
+    static var mjpegScalingFactor: CGFloat {
+        let percent = env("MJPEG_SCALING_FACTOR").flatMap(Double.init).map { min(100, max(1, $0)) } ?? 100
+        return CGFloat(percent / 100.0)
+    }
 
     static var screenshotsDirectory: URL {
         let dir = FileManager.default.temporaryDirectory.appendingPathComponent("RemoteControlScreenshots", isDirectory: true)
