@@ -70,6 +70,7 @@ final class RemoteControlTest: XCTestCase {
         // enter background
         XCUIDevice.shared.press(.home)
         // loop
+        broker.markConsuming()
         let deadline = Date().addingTimeInterval(Config.maxSessionSeconds)
         while !broker.shouldExit, Date() < deadline {
             if let command = broker.next(timeout: 0.2) {
@@ -279,7 +280,15 @@ final class RemoteControlTest: XCTestCase {
         let server = HttpServer()
 
         server["/api/health"] = { [weak self] _ in
-            self?.jsonResponse(["status": "ok", "uptime": ProcessInfo.processInfo.systemUptime]) ?? .internalServerError
+            guard let self else { return .internalServerError }
+            guard self.broker.isConsuming else {
+                return self.jsonResponse(
+                    ["status": "not_ready", "reason": "command loop not started"],
+                    code: 503,
+                    reason: "Service Unavailable"
+                )
+            }
+            return self.jsonResponse(["status": "ok", "uptime": ProcessInfo.processInfo.systemUptime])
         }
         server["/api/launch"] = { [weak self] request in
             self?.appCommand(request) { .launch(bundleId: $0) } ?? .internalServerError
@@ -532,10 +541,23 @@ private final class CommandBroker {
     private let condition = NSCondition()
     private var queue: [Command] = []
     private var exitRequested = false
+    /// True once the main test thread enters the command consumption loop.
+    private var consuming = false
 
     var shouldExit: Bool {
         condition.lock(); defer { condition.unlock() }
         return exitRequested
+    }
+
+    var isConsuming: Bool {
+        condition.lock(); defer { condition.unlock() }
+        return consuming
+    }
+
+    func markConsuming() {
+        condition.lock()
+        consuming = true
+        condition.unlock()
     }
 
     /// Called on a server thread: enqueues work and blocks until it completes.
