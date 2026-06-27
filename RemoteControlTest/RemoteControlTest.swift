@@ -55,7 +55,6 @@ final class RemoteControlTest: XCTestCase {
     override func setUpWithError() throws {
         continueAfterFailure = false
         try startServer()
-        acceptLocalNetworkPromptIfNeeded()
     }
 
     override func tearDownWithError() throws {
@@ -67,10 +66,13 @@ final class RemoteControlTest: XCTestCase {
     /// command's UI work here, and fires due periodic screenshots between
     /// commands. Runs until a client hits `/api/exit` or the session cap.
     func testRemoteControl() throws {
-        // enter background
-        XCUIDevice.shared.press(.home)
-        // loop
-        broker.markConsuming()
+        // The consumer loop owns initialization: accept the Local Network prompt
+        // and background the runner here (serial main-thread work) while health
+        // reports `initializing`, then flip to `ready` before draining commands.
+        broker.markInitializing()
+        prepareSession()
+        broker.markReady()
+
         let deadline = Date().addingTimeInterval(Config.maxSessionSeconds)
         while !broker.shouldExit, Date() < deadline {
             if let command = broker.next(timeout: 0.2) {
@@ -84,6 +86,14 @@ final class RemoteControlTest: XCTestCase {
                 runMeasurement(app: app, sessionDeadline: deadline, duration: duration)
             }
         }
+    }
+
+    /// Main-thread initialization run as the first step of the consumer loop:
+    /// accept the one-time Local Network privacy prompt (cheap on warm launches),
+    /// then background the runner so the device returns to SpringBoard.
+    private func prepareSession() {
+        acceptLocalNetworkPromptIfNeeded()
+        XCUIDevice.shared.press(.home)
     }
 
     /// Opens a single `XCTMemoryMetric` window on `app`.
@@ -281,9 +291,10 @@ final class RemoteControlTest: XCTestCase {
 
         server["/api/health"] = { [weak self] _ in
             guard let self else { return .internalServerError }
-            guard self.broker.isConsuming else {
+            let phase = self.broker.currentPhase
+            guard phase == .ready else {
                 return self.jsonResponse(
-                    ["status": "not_ready", "reason": "command loop not started"],
+                    ["status": "not_ready", "reason": phase.rawValue],
                     code: 503,
                     reason: "Service Unavailable"
                 )
@@ -421,21 +432,71 @@ final class RemoteControlTest: XCTestCase {
     /// guidance is to send an IPv4 UDP broadcast, so we do that (plus a poke at
     /// our now-live server) and retry in a short loop while polling for the alert.
     private func acceptLocalNetworkPromptIfNeeded() {
+        // 1) Already granted on a previous launch: the system caches the choice,
+        //    so skip the whole dance (the big win on warm relaunches).
+        if Config.localNetworkGranted { return }
+
         XCUIApplication(bundleIdentifier: Config.runnerBundleIdentifier).activate()
 
-        let deadline = Date().addingTimeInterval(8)
+        // 2) Probe first: if we can already reach our own server over the LAN,
+        //    access is granted and no prompt will appear, so don't waste time.
+        if probeLocalServer(timeout: 0.6) {
+            Config.localNetworkGranted = true
+            return
+        }
+
+        // 3) Provoke and accept the prompt, retrying briefly. Re-probe each pass
+        //    so a silent grant short-circuits the loop.
+        let deadline = Date().addingTimeInterval(5)
         repeat {
             triggerLocalNetworkTraffic()
 
             let alert = springboard.alerts.firstMatch
-            if alert.waitForExistence(timeout: 2) {
+            if alert.waitForExistence(timeout: 1) {
                 for label in ["Allow", "允许", "允許"] {
                     let button = alert.buttons[label]
-                    if button.exists { return button.tap() }
+                    if button.exists {
+                        button.tap()
+                        Config.localNetworkGranted = true
+                        return
+                    }
                 }
-                return alert.buttons.allElementsBoundByIndex.last?.tap() ?? ()
+                alert.buttons.allElementsBoundByIndex.last?.tap()
+                Config.localNetworkGranted = true
+                return
             }
-        } while Date() < deadline
+
+            if probeLocalServer(timeout: 0.3) {
+                Config.localNetworkGranted = true
+                return
+            }
+        } while !broker.shouldExit && Date() < deadline
+    }
+
+    /// Synchronously probes our own server's `/api/health` over the LAN unicast
+    /// address with a short timeout. Returns `true` on any HTTP response (the
+    /// connection succeeding is what signals Local Network access is granted).
+    private func probeLocalServer(timeout: TimeInterval) -> Bool {
+        guard let ip = primaryIPAddress(),
+              let url = URL(string: "http://\(ip):\(Config.serverPort)/api/health") else {
+            return false
+        }
+
+        var request = URLRequest(url: url)
+        request.timeoutInterval = timeout
+
+        let semaphore = DispatchSemaphore(value: 0)
+        var reachable = false
+        let task = URLSession.shared.dataTask(with: request) { _, response, _ in
+            reachable = (response as? HTTPURLResponse) != nil
+            semaphore.signal()
+        }
+        task.resume()
+        if semaphore.wait(timeout: .now() + timeout) == .timedOut {
+            task.cancel()
+            return false
+        }
+        return reachable
     }
 
     /// Emits outbound LAN traffic to provoke the Local Network privacy prompt:
@@ -538,25 +599,39 @@ private enum CommandResult {
 /// Thread-safe FIFO bridging the server's background threads to the single
 /// main-thread consumer.
 private final class CommandBroker {
+    /// Lifecycle of the main-thread consumer, surfaced via `/api/health`:
+    /// `notStarted` before the loop, `initializing` during setup
+    /// (prompt accept / backgrounding), `ready` once commands are drained.
+    enum Phase: String {
+        case notStarted
+        case initializing
+        case ready
+    }
+
     private let condition = NSCondition()
     private var queue: [Command] = []
     private var exitRequested = false
-    /// True once the main test thread enters the command consumption loop.
-    private var consuming = false
+    private var phase: Phase = .notStarted
 
     var shouldExit: Bool {
         condition.lock(); defer { condition.unlock() }
         return exitRequested
     }
 
-    var isConsuming: Bool {
+    var currentPhase: Phase {
         condition.lock(); defer { condition.unlock() }
-        return consuming
+        return phase
     }
 
-    func markConsuming() {
+    func markInitializing() {
         condition.lock()
-        consuming = true
+        phase = .initializing
+        condition.unlock()
+    }
+
+    func markReady() {
+        condition.lock()
+        phase = .ready
         condition.unlock()
     }
 
@@ -616,6 +691,15 @@ private enum Config {
         let dir = FileManager.default.temporaryDirectory.appendingPathComponent("RemoteControlScreenshots", isDirectory: true)
         try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
         return dir
+    }
+
+    /// Whether the one-time Local Network privacy prompt has already been
+    /// accepted. iOS persists the system permission per app, so caching our own
+    /// decision lets warm relaunches skip the prompt-provoking loop entirely.
+    private static let localNetworkGrantedKey = "RemoteControl.localNetworkGranted"
+    static var localNetworkGranted: Bool {
+        get { UserDefaults.standard.bool(forKey: localNetworkGrantedKey) }
+        set { UserDefaults.standard.set(newValue, forKey: localNetworkGrantedKey) }
     }
 
     private static func env(_ key: String) -> String? {
