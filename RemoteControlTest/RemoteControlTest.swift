@@ -20,6 +20,7 @@ import Swifter
 ///   GET  /api/screenshot                          capture one screenshot (PNG)
 ///   *    /api/screenshot/start?interval=1&limit=0 begin periodic screenshots
 ///   *    /api/screenshot/stop                     stop periodic screenshots
+///   *    /api/tap?x=0.5&y=0.5&bundleId=...         tap a normalized point (anchored to the app's orientation)
 ///   GET  /api/measuring/start?bundleId=...        open an XCTMemoryMetric window on an app
 ///   GET  /api/measuring/period/{seconds}?bundleId=...  measure for a fixed duration, then auto-close
 ///   GET  /api/measuring/stop                      close the measured window
@@ -197,6 +198,28 @@ final class RemoteControlTest: XCTestCase {
             let data = captureScreenshot(tag: "on-demand")
             command.finish(.png(data))
 
+        case .tap(let x, let y, let bundleId):
+            // Tap an absolute screen point given as a normalized offset
+            // ([0,1] fractions of the screen, resolution/scale independent).
+            //
+            // The offset is anchored to the foreground app's frame when a
+            // bundleId is supplied, otherwise to SpringBoard. This matters for
+            // orientation: SpringBoard is portrait-locked, so anchoring there
+            // taps the wrong physical point for a landscape app. The app's own
+            // frame tracks the current interface orientation and lines up with
+            // `XCUIScreen.main.screenshot()`, which callers normalize against.
+            let anchor: XCUIApplication = (bundleId?.isEmpty == false)
+                ? XCUIApplication(bundleIdentifier: bundleId!)
+                : springboard
+            let coordinate = anchor.coordinate(withNormalizedOffset: CGVector(dx: x, dy: y))
+            coordinate.tap()
+            command.finish(.json([
+                "status": "ok",
+                "action": "tap",
+                "x": x,
+                "y": y,
+            ]))
+
         case .startPeriodicScreenshots(let interval, let limit):
             periodic = PeriodicSchedule(interval: interval, limit: limit)
             command.finish(.json([
@@ -364,6 +387,18 @@ final class RemoteControlTest: XCTestCase {
         server["/api/screenshot/stop"] = { [weak self] _ in
             guard let self else { return .internalServerError }
             return self.httpResponse(for: self.broker.submit(.stopPeriodicScreenshots))
+        }
+        server["/api/tap"] = { [weak self] request in
+            guard let self else { return .internalServerError }
+            let params = self.params(request)
+            guard let x = params["x"].flatMap(Double.init),
+                  let y = params["y"].flatMap(Double.init) else {
+                return self.jsonResponse(["status": "error", "reason": "missing or invalid x/y"], code: 400, reason: "Bad Request")
+            }
+            guard (0...1).contains(x), (0...1).contains(y) else {
+                return self.jsonResponse(["status": "error", "reason": "x and y must be normalized in [0, 1]"], code: 400, reason: "Bad Request")
+            }
+            return self.httpResponse(for: self.broker.submit(.tap(x: x, y: y, bundleId: params["bundleId"])))
         }
         server.GET["/api/measuring/start"] = { [weak self] request in
             self?.appCommand(request) { .startMeasuring(bundleId: $0) } ?? .internalServerError
@@ -636,6 +671,7 @@ private final class Command {
         case activate(bundleId: String)
         case terminate(bundleId: String)
         case screenshot
+        case tap(x: Double, y: Double, bundleId: String?)
         case startPeriodicScreenshots(interval: TimeInterval, limit: Int?)
         case stopPeriodicScreenshots
         case startMeasuring(bundleId: String)
