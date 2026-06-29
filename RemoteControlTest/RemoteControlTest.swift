@@ -57,6 +57,12 @@ final class RemoteControlTest: XCTestCase {
     /// notifications, App tracking, location, photos, Bluetooth, etc. Polled
     /// between commands on the main test thread.
     private var nextPermissionCheck = Date()
+    /// The watcher only runs until this deadline. Permission prompts arrive
+    /// shortly after an app comes to the foreground, so rather than poll
+    /// SpringBoard for the whole (multi-hour) session we open a bounded window
+    /// on each launch/activate, then stop. `distantPast` keeps it off until the
+    /// first app is foregrounded.
+    private var permissionWatchUntil = Date.distantPast
 
     override func setUpWithError() throws {
         continueAfterFailure = false
@@ -103,6 +109,13 @@ final class RemoteControlTest: XCTestCase {
         XCUIDevice.shared.press(.home)
     }
 
+    /// Opens the bounded permission-watch window, after which
+    /// `drivePermissionPrompts()` stops polling SpringBoard. Armed on each
+    /// launch/activate, since prompts only appear once an app is foregrounded.
+    private func armPermissionWatch() {
+        permissionWatchUntil = Date().addingTimeInterval(Config.permissionWatchWindow)
+    }
+
     /// Opens a single `XCTMemoryMetric` window on `app`.
     ///
     /// `measure` runs its block synchronously on this (main test) thread, so the
@@ -146,6 +159,7 @@ final class RemoteControlTest: XCTestCase {
     private func execute(_ command: Command) {
         switch command.action {
         case .launch(let bundleId):
+            armPermissionWatch()
             let app = XCUIApplication(bundleIdentifier: bundleId)
             if app.state != .notRunning { app.terminate() }
             app.launch()
@@ -158,6 +172,7 @@ final class RemoteControlTest: XCTestCase {
             ]))
 
         case .activate(let bundleId):
+            armPermissionWatch()
             let app = XCUIApplication(bundleIdentifier: bundleId)
             app.activate()
             let ok = app.wait(for: .runningForeground, timeout: 30)
@@ -274,13 +289,15 @@ final class RemoteControlTest: XCTestCase {
         }
     }
 
-    /// System-permission watcher. Between commands, periodically accepts any
+    /// System-permission watcher. While the watch window is open (armed on
+    /// each launch/activate), periodically accepts any
     /// permission prompt a foregrounded app (e.g. a freshly launched game)
     /// raises — notifications, App tracking, location, photos, Bluetooth,
     /// camera/microphone, etc. — by tapping the most permissive "allow"
     /// button. Throttled by `permissionWatchInterval` and uses a non-blocking
     /// existence check so it never stalls the command loop.
     private func drivePermissionPrompts() {
+        guard Date() < permissionWatchUntil else { return }
         guard Date() >= nextPermissionCheck else { return }
         nextPermissionCheck = Date().addingTimeInterval(Config.permissionWatchInterval)
         dismissPermissionAlertIfPresent(waitTimeout: 0)
@@ -748,6 +765,11 @@ private enum Config {
     /// alert to auto-accept. Lower is more responsive but queries the UI tree
     /// more often.
     static var permissionWatchInterval: TimeInterval { env("PERMISSION_WATCH_INTERVAL").flatMap(TimeInterval.init) ?? 1.5 }
+
+    /// How long the permission watcher keeps polling after it is armed (each
+    /// launch/activate). Prompts arrive soon after an app comes to the
+    /// foreground, so a short window suffices; polling stops afterward.
+    static var permissionWatchWindow: TimeInterval { env("PERMISSION_WATCH_WINDOW").flatMap(TimeInterval.init) ?? 5 * 60 }
 
     static var screenshotsDirectory: URL {
         let dir = FileManager.default.temporaryDirectory.appendingPathComponent("RemoteControlScreenshots", isDirectory: true)
