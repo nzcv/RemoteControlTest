@@ -52,6 +52,12 @@ final class RemoteControlTest: XCTestCase {
     /// Set by a `stopMeasuring` command to close the open window.
     private var measureStopRequested = false
 
+    /// Next due time for the system-permission watcher that auto-accepts
+    /// prompts a foregrounded app (e.g. a freshly launched game) raises —
+    /// notifications, App tracking, location, photos, Bluetooth, etc. Polled
+    /// between commands on the main test thread.
+    private var nextPermissionCheck = Date()
+
     override func setUpWithError() throws {
         continueAfterFailure = false
         try startServer()
@@ -79,6 +85,7 @@ final class RemoteControlTest: XCTestCase {
                 execute(command)
             }
             drivePeriodicScreenshots()
+            drivePermissionPrompts()
             if let app = pendingMeasureApp {
                 let duration = pendingMeasureDuration
                 pendingMeasureApp = nil
@@ -128,6 +135,7 @@ final class RemoteControlTest: XCTestCase {
                     execute(command)
                 }
                 drivePeriodicScreenshots()
+                drivePermissionPrompts()
             }
             stopMeasuring()
         }
@@ -264,6 +272,18 @@ final class RemoteControlTest: XCTestCase {
         } else {
             periodic = schedule
         }
+    }
+
+    /// System-permission watcher. Between commands, periodically accepts any
+    /// permission prompt a foregrounded app (e.g. a freshly launched game)
+    /// raises — notifications, App tracking, location, photos, Bluetooth,
+    /// camera/microphone, etc. — by tapping the most permissive "allow"
+    /// button. Throttled by `permissionWatchInterval` and uses a non-blocking
+    /// existence check so it never stalls the command loop.
+    private func drivePermissionPrompts() {
+        guard Date() >= nextPermissionCheck else { return }
+        nextPermissionCheck = Date().addingTimeInterval(Config.permissionWatchInterval)
+        dismissPermissionAlertIfPresent(waitTimeout: 0)
     }
 
     /// Captures a full-screen PNG, attaches it to the result bundle, and also
@@ -420,12 +440,13 @@ final class RemoteControlTest: XCTestCase {
         }
     }
 
-    // MARK: - Local Network privacy prompt
+    // MARK: - System permission prompts (Local Network / wireless data)
 
-    /// iOS gates LAN access behind a one-time Local Network privacy prompt that
-    /// the XCTRunner never answers on its own. Bring the runner forward, generate
-    /// outbound LAN traffic to raise the prompt, then accept it; the choice is
-    /// cached for subsequent launches.
+    /// iOS gates LAN access behind one-time privacy prompts the XCTRunner never
+    /// answers on its own: the Local Network prompt and, on cellular-capable
+    /// devices, a "use wireless data" prompt. Bring the runner forward, generate
+    /// outbound LAN traffic to raise them, then accept; the choice is cached for
+    /// subsequent launches.
     ///
     /// The prompt only fires on *outbound* local-network traffic, and a single
     /// connection to our own unicast IP is an unreliable trigger. Apple's
@@ -445,32 +466,68 @@ final class RemoteControlTest: XCTestCase {
             return
         }
 
-        // 3) Provoke and accept the prompt, retrying briefly. Re-probe each pass
-        //    so a silent grant short-circuits the loop.
+        // 3) Provoke and accept the prompt(s), retrying briefly. Two different
+        //    system alerts can block the LAN server — the Local Network prompt
+        //    and the cellular "use wireless data" prompt — and they may appear
+        //    one after another, so we dismiss whatever is on screen each pass
+        //    and keep going until the server is actually reachable.
         let deadline = Date().addingTimeInterval(5)
         repeat {
             triggerLocalNetworkTraffic()
+            dismissPermissionAlertIfPresent()
 
-            let alert = springboard.alerts.firstMatch
-            if alert.waitForExistence(timeout: 1) {
-                for label in ["Allow", "允许", "允許"] {
-                    let button = alert.buttons[label]
-                    if button.exists {
-                        button.tap()
-                        Config.localNetworkGranted = true
-                        return
-                    }
-                }
-                alert.buttons.allElementsBoundByIndex.last?.tap()
-                Config.localNetworkGranted = true
-                return
-            }
-
+            // The server becoming reachable over the LAN is the real signal
+            // that access was granted, so let it short-circuit the loop.
             if probeLocalServer(timeout: 0.3) {
                 Config.localNetworkGranted = true
                 return
             }
         } while !broker.shouldExit && Date() < deadline
+    }
+
+    /// Most permissive "allow" buttons, in priority order, across the system
+    /// permission alerts we auto-accept. Two situations rely on this list: the
+    /// runner's own Local Network / cellular prompts during init, and the
+    /// prompts a foregrounded game raises after launch (notifications, App
+    /// tracking, location, photos, Bluetooth, camera/microphone, ...). For
+    /// each alert the first matching label is tapped, so more-specific /
+    /// more-permissive labels come first; a Wi-Fi-only or one-time-allow
+    /// choice is kept as a sufficient fallback. The explicit allow-list also
+    /// means we never tap "Don't Allow" / "不允许".
+    private static let permissionAllowLabels = [
+        // Cellular "use wireless data" prompt — prefer full access.
+        "无线局域网与蜂窝网络", "WLAN 与蜂窝网络", "WLAN与蜂窝网络",
+        "Wi-Fi & Cellular Data", "Wi-Fi & Cellular",
+        // Wi-Fi-only choice on the same prompt is sufficient for LAN access.
+        "仅限无线局域网", "无线局域网", "WLAN", "Wi-Fi",
+        // Location prompt — prefer the most persistent grant.
+        "始终允许", "Always Allow",
+        "使用App时允许", "使用 App 时允许", "Allow While Using App",
+        "允许一次", "Allow Once",
+        // Photos prompt — full library access.
+        "允许访问所有照片", "Allow Access to All Photos",
+        // Generic allow / confirm for the remaining prompts (notifications,
+        // App tracking, Bluetooth, camera, microphone, contacts, ...).
+        "允许", "允許", "好", "好的", "确定",
+        "Allow", "OK",
+    ]
+
+    /// Taps the most permissive allow button on any system permission alert
+    /// currently shown by SpringBoard, using `permissionAllowLabels`. No-op
+    /// when no alert is present or none of the known buttons match. Returns
+    /// whether a button was tapped. `waitTimeout` of 0 does a non-blocking
+    /// existence check (used by the in-loop watcher); a positive value waits
+    /// for the alert to appear (used during one-shot init).
+    @discardableResult
+    private func dismissPermissionAlertIfPresent(waitTimeout: TimeInterval = 1) -> Bool {
+        let alert = springboard.alerts.firstMatch
+        let present = waitTimeout > 0 ? alert.waitForExistence(timeout: waitTimeout) : alert.exists
+        guard present else { return false }
+        for label in Self.permissionAllowLabels where alert.buttons[label].exists {
+            alert.buttons[label].tap()
+            return true
+        }
+        return false
     }
 
     /// Synchronously probes our own server's `/api/health` over the LAN unicast
@@ -686,6 +743,11 @@ private enum Config {
     static var testBundleIdentifier: String { env("TEST_BUNDLE_IDENTIFIER") ?? "com.idevice.RemoteControlTest" }
     static var runnerBundleIdentifier: String { env("RUNNER_BUNDLE_IDENTIFIER") ?? testBundleIdentifier + ".xctrunner" }
     static var maxSessionSeconds: TimeInterval { env("MAX_SESSION_SECONDS").flatMap(TimeInterval.init) ?? 6 * 60 * 60 }
+
+    /// How often the in-loop watcher scans SpringBoard for a system-permission
+    /// alert to auto-accept. Lower is more responsive but queries the UI tree
+    /// more often.
+    static var permissionWatchInterval: TimeInterval { env("PERMISSION_WATCH_INTERVAL").flatMap(TimeInterval.init) ?? 1.5 }
 
     static var screenshotsDirectory: URL {
         let dir = FileManager.default.temporaryDirectory.appendingPathComponent("RemoteControlScreenshots", isDirectory: true)
