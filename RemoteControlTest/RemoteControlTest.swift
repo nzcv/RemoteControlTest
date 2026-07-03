@@ -106,8 +106,16 @@ final class RemoteControlTest: XCTestCase {
     /// accept the one-time Local Network privacy prompt (cheap on warm launches),
     /// then background the runner so the device returns to SpringBoard.
     private func prepareSession() {
+        resetScreenshotsDirectory()
         acceptLocalNetworkPromptIfNeeded()
         XCUIDevice.shared.press(.home)
+    }
+
+    /// Wipes any screenshots left on the device by a previous session so the
+    /// on-device directory never accumulates across runs. Recreated lazily by
+    /// `Config.screenshotsDirectory` on the next capture.
+    private func resetScreenshotsDirectory() {
+        try? FileManager.default.removeItem(at: Config.screenshotsDirectory)
     }
 
     /// Opens the bounded permission-watch window, after which
@@ -341,7 +349,36 @@ final class RemoteControlTest: XCTestCase {
         let stamp = Int(Date().timeIntervalSince1970 * 1000)
         let url = Config.screenshotsDirectory.appendingPathComponent("\(tag)-\(stamp).png")
         try? data.write(to: url)
+        pruneDeviceScreenshots()
         return data
+    }
+
+    /// Enforces `Config.maxDeviceScreenshots` on the on-device screenshot
+    /// directory by deleting the oldest PNGs once the count exceeds the cap.
+    /// A cap of zero or less leaves the directory unbounded.
+    private func pruneDeviceScreenshots() {
+        let cap = Config.maxDeviceScreenshots
+        guard cap > 0 else { return }
+
+        let fm = FileManager.default
+        let dir = Config.screenshotsDirectory
+        guard let files = try? fm.contentsOfDirectory(
+            at: dir,
+            includingPropertiesForKeys: [.contentModificationDateKey],
+            options: [.skipsHiddenFiles]
+        ) else { return }
+
+        guard files.count > cap else { return }
+
+        let sorted = files.sorted { lhs, rhs in
+            let lhsDate = (try? lhs.resourceValues(forKeys: [.contentModificationDateKey]).contentModificationDate) ?? .distantPast
+            let rhsDate = (try? rhs.resourceValues(forKeys: [.contentModificationDateKey]).contentModificationDate) ?? .distantPast
+            return lhsDate < rhsDate
+        }
+
+        for url in sorted.prefix(files.count - cap) {
+            try? fm.removeItem(at: url)
+        }
     }
 
     // MARK: - swifter server
@@ -812,6 +849,11 @@ private enum Config {
         try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
         return dir
     }
+
+    /// Upper bound on how many PNGs the on-device screenshot directory keeps;
+    /// older files past this count are pruned after each capture. A value of
+    /// zero or less disables the cap. Override with `MAX_DEVICE_SCREENSHOTS`.
+    static var maxDeviceScreenshots: Int { env("MAX_DEVICE_SCREENSHOTS").flatMap(Int.init) ?? 200 }
 
     /// Whether the one-time Local Network privacy prompt has already been
     /// accepted. iOS persists the system permission per app, so caching our own
