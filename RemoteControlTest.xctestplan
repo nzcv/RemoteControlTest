@@ -1,0 +1,26 @@
+{
+  "configurations" : [
+    {
+      "id" : "A1B2C3D4-0000-4000-8000-000000000001",
+      "name" : "Configuration 1",
+      "options" : {
+
+      }
+    }
+  ],
+  "defaultOptions" : {
+    "preferredScreenCaptureFormat" : "screenshot",
+    "uiTestingScreenshotsLifetime" : "keepNever",
+    "userAttachmentLifetime" : "keepAlways"
+  },
+  "testTargets" : [
+    {
+      "target" : {
+        "containerPath" : "container:RemoteControlTest.xcodeproj",
+        "identifier" : "B1C2D3E4F5A600000000000B",
+        "name" : "RemoteControlTest"
+      }
+    }
+  ],
+  "version" : 1
+}

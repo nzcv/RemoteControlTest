@@ -334,17 +334,27 @@ final class RemoteControlTest: XCTestCase {
         dismissPermissionAlertIfPresent(waitTimeout: 0)
     }
 
-    /// Captures a full-screen PNG, attaches it to the result bundle, and also
-    /// writes it to a temp directory on the device for out-of-band retrieval.
+    /// Captures a full-screen PNG and writes it to a temp directory on the
+    /// device for out-of-band retrieval. The PNG is also returned to the caller
+    /// (served directly over HTTP by `/api/screenshot`).
+    ///
+    /// It is *not* attached to the test result bundle by default:
+    /// `XCTAttachment`s live for the whole (multi-hour) session and never get a
+    /// chance to be pruned before the runner exits, so keeping every screenshot
+    /// would inflate the on-device result bundle (and iOS "System Data") without
+    /// bound. The HTTP response and the size-capped temp directory already cover
+    /// retrieval; set `ATTACH_SCREENSHOTS=1` to opt back in when debugging.
     @discardableResult
     private func captureScreenshot(tag: String) -> Data {
         let screenshot = XCUIScreen.main.screenshot()
         let data = screenshot.pngRepresentation
 
-        let attachment = XCTAttachment(screenshot: screenshot)
-        attachment.name = tag
-        attachment.lifetime = .keepAlways
-        add(attachment)
+        if Config.attachScreenshots {
+            let attachment = XCTAttachment(screenshot: screenshot)
+            attachment.name = tag
+            attachment.lifetime = .keepAlways
+            add(attachment)
+        }
 
         let stamp = Int(Date().timeIntervalSince1970 * 1000)
         let url = Config.screenshotsDirectory.appendingPathComponent("\(tag)-\(stamp).png")
@@ -854,6 +864,18 @@ private enum Config {
     /// older files past this count are pruned after each capture. A value of
     /// zero or less disables the cap. Override with `MAX_DEVICE_SCREENSHOTS`.
     static var maxDeviceScreenshots: Int { env("MAX_DEVICE_SCREENSHOTS").flatMap(Int.init) ?? 200 }
+
+    /// Whether captured screenshots are also attached to the test result
+    /// bundle. Attachments are `keepAlways` and persist for the whole session,
+    /// so they accumulate without bound over a multi-hour run and are redundant
+    /// with the HTTP response and the size-capped temp directory. Off by
+    /// default; enable with `ATTACH_SCREENSHOTS=1` for debugging.
+    static var attachScreenshots: Bool {
+        switch env("ATTACH_SCREENSHOTS")?.lowercased() {
+        case "1", "true", "yes": return true
+        default: return false
+        }
+    }
 
     /// Whether the one-time Local Network privacy prompt has already been
     /// accepted. iOS persists the system permission per app, so caching our own
