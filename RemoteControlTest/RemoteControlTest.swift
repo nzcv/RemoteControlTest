@@ -188,7 +188,7 @@ final class RemoteControlTest: XCTestCase {
             ]))
 
         case .screenshot:
-            let data = captureScreenshot(tag: "on-demand")
+            let data = captureScreenshot()
             command.finish(.png(data))
 
         case .tap(let x, let y, let bundleId):
@@ -290,22 +290,9 @@ final class RemoteControlTest: XCTestCase {
     /// Captures a full-screen PNG and returns it to the caller (served directly
     /// over HTTP by `/api/screenshot`). Nothing is written to the device —
     /// matching WebDriverAgent's in-memory-only screenshot path.
-    ///
-    /// Set `ATTACH_SCREENSHOTS=1` to also attach to the `.xcresult` (debugging
-    /// only; attachments accumulate for the whole session and inflate system data).
     @discardableResult
-    private func captureScreenshot(tag: String) -> Data {
-        let screenshot = XCUIScreen.main.screenshot()
-        let data = screenshot.pngRepresentation
-
-        if Config.attachScreenshots {
-            let attachment = XCTAttachment(screenshot: screenshot)
-            attachment.name = tag
-            attachment.lifetime = .deleteOnSuccess
-            add(attachment)
-        }
-
-        return data
+    private func captureScreenshot() -> Data {
+        XCUIScreen.main.screenshot().pngRepresentation
     }
 
     // MARK: - swifter server
@@ -749,16 +736,6 @@ private enum Config {
     /// launch/activate). Prompts arrive soon after an app comes to the
     /// foreground, so a short window suffices; polling stops afterward.
     static var permissionWatchWindow: TimeInterval { env("PERMISSION_WATCH_WINDOW").flatMap(TimeInterval.init) ?? 5 * 60 }
-
-    /// Whether captured screenshots are also attached to the test result bundle.
-    /// Attachments accumulate for the whole session and inflate iOS "System
-    /// Data"; off by default. Enable with `ATTACH_SCREENSHOTS=1` for debugging.
-    static var attachScreenshots: Bool {
-        switch env("ATTACH_SCREENSHOTS")?.lowercased() {
-        case "1", "true", "yes": return true
-        default: return false
-        }
-    }
 
     /// Whether the one-time Local Network privacy prompt has already been
     /// accepted. iOS persists the system permission per app, so caching our own

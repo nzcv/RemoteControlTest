@@ -43,7 +43,6 @@ HTTP only — nothing is written to the device (same as WebDriverAgent).
 | -------- | ------- | ------- |
 | `SERVER_PORT` | `18200` | Port the swifter server binds |
 | `MAX_SESSION_SECONDS` | `21600` | Hard cap on how long the runner stays alive |
-| `ATTACH_SCREENSHOTS` | `0` | Attach screenshots to the `.xcresult` bundle (debugging; inflates system data) |
 
 ### Reducing iOS "System Data"
 
