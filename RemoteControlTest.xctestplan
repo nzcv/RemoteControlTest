@@ -11,7 +11,7 @@
   "defaultOptions" : {
     "preferredScreenCaptureFormat" : "screenshot",
     "uiTestingScreenshotsLifetime" : "keepNever",
-    "userAttachmentLifetime" : "keepAlways"
+    "userAttachmentLifetime" : "deleteOnSuccess"
   },
   "testTargets" : [
     {

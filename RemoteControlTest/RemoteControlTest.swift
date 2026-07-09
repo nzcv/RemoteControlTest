@@ -18,8 +18,6 @@ import Swifter
 ///   *    /api/terminate?bundleId=...              terminate an app
 ///   GET  /api/terminate/{bundleId}               terminate an app (path param)
 ///   GET  /api/screenshot                          capture one screenshot (PNG)
-///   *    /api/screenshot/start?interval=1&limit=0 begin periodic screenshots
-///   *    /api/screenshot/stop                     stop periodic screenshots
 ///   *    /api/tap?x=0.5&y=0.5&bundleId=...         tap a normalized point (anchored to the app's orientation)
 ///   GET  /api/measuring/start?bundleId=...        open an XCTMemoryMetric window on an app
 ///   GET  /api/measuring/period/{seconds}?bundleId=...  measure for a fixed duration, then auto-close
@@ -27,15 +25,12 @@ import Swifter
 ///   GET  /api/measuring/status                    report the current measuring state
 ///   GET  /api/exit                                quit the runner
 ///
-/// `bundleId`, `interval`, and `limit` may be supplied as query parameters or
-/// in a JSON request body; `*` accepts any HTTP method.
+/// `bundleId` may be supplied as a query parameter or in a JSON request body;
+/// `*` accepts any HTTP method.
 final class RemoteControlTest: XCTestCase {
     private let springboard = XCUIApplication(bundleIdentifier: "com.apple.springboard")
     private let broker = CommandBroker()
     private var server: HttpServer?
-
-    /// Periodic-screenshot schedule. Touched only on the main test thread.
-    private var periodic: PeriodicSchedule?
 
     /// An app whose memory the next loop iteration should open a measured
     /// window on. Armed by a `startMeasuring` command, consumed on the main
@@ -76,8 +71,8 @@ final class RemoteControlTest: XCTestCase {
     }
 
     /// The single main-thread consumer. Drains the broker, executing each
-    /// command's UI work here, and fires due periodic screenshots between
-    /// commands. Runs until a client hits `/api/exit` or the session cap.
+    /// command's UI work here. Runs until a client hits `/api/exit` or the
+    /// session cap.
     func testRemoteControl() throws {
         // The consumer loop owns initialization: accept the Local Network prompt
         // and background the runner here (serial main-thread work) while health
@@ -91,7 +86,6 @@ final class RemoteControlTest: XCTestCase {
             if let command = broker.next(timeout: 0.2) {
                 execute(command)
             }
-            drivePeriodicScreenshots()
             drivePermissionPrompts()
             if let app = pendingMeasureApp {
                 let duration = pendingMeasureDuration
@@ -106,16 +100,8 @@ final class RemoteControlTest: XCTestCase {
     /// accept the one-time Local Network privacy prompt (cheap on warm launches),
     /// then background the runner so the device returns to SpringBoard.
     private func prepareSession() {
-        resetScreenshotsDirectory()
         acceptLocalNetworkPromptIfNeeded()
         XCUIDevice.shared.press(.home)
-    }
-
-    /// Wipes any screenshots left on the device by a previous session so the
-    /// on-device directory never accumulates across runs. Recreated lazily by
-    /// `Config.screenshotsDirectory` on the next capture.
-    private func resetScreenshotsDirectory() {
-        try? FileManager.default.removeItem(at: Config.screenshotsDirectory)
     }
 
     /// Opens the bounded permission-watch window, after which
@@ -156,7 +142,6 @@ final class RemoteControlTest: XCTestCase {
                 if let command = broker.next(timeout: 0.2) {
                     execute(command)
                 }
-                drivePeriodicScreenshots()
                 drivePermissionPrompts()
             }
             stopMeasuring()
@@ -228,24 +213,6 @@ final class RemoteControlTest: XCTestCase {
                 "y": y,
             ]))
 
-        case .startPeriodicScreenshots(let interval, let limit):
-            periodic = PeriodicSchedule(interval: interval, limit: limit)
-            command.finish(.json([
-                "status": "ok",
-                "action": "startScreenshots",
-                "interval": interval,
-                "limit": limit ?? 0,
-            ]))
-
-        case .stopPeriodicScreenshots:
-            let captured = periodic?.captured ?? 0
-            periodic = nil
-            command.finish(.json([
-                "status": "ok",
-                "action": "stopScreenshots",
-                "captured": captured,
-            ]))
-
         case .startMeasuring(let bundleId):
             if measuringActive {
                 command.finish(.json([
@@ -306,20 +273,6 @@ final class RemoteControlTest: XCTestCase {
         }
     }
 
-    /// Fires the next periodic screenshot if its interval has elapsed, and
-    /// retires the schedule once an optional capture limit is reached.
-    private func drivePeriodicScreenshots() {
-        guard var schedule = periodic, Date() >= schedule.nextFireDate else { return }
-        captureScreenshot(tag: "periodic-\(schedule.captured)")
-        schedule.captured += 1
-        schedule.nextFireDate = Date().addingTimeInterval(schedule.interval)
-        if let limit = schedule.limit, schedule.captured >= limit {
-            periodic = nil
-        } else {
-            periodic = schedule
-        }
-    }
-
     /// System-permission watcher. While the watch window is open (armed on
     /// each launch/activate), periodically accepts any
     /// permission prompt a foregrounded app (e.g. a freshly launched game)
@@ -334,16 +287,12 @@ final class RemoteControlTest: XCTestCase {
         dismissPermissionAlertIfPresent(waitTimeout: 0)
     }
 
-    /// Captures a full-screen PNG and writes it to a temp directory on the
-    /// device for out-of-band retrieval. The PNG is also returned to the caller
-    /// (served directly over HTTP by `/api/screenshot`).
+    /// Captures a full-screen PNG and returns it to the caller (served directly
+    /// over HTTP by `/api/screenshot`). Nothing is written to the device —
+    /// matching WebDriverAgent's in-memory-only screenshot path.
     ///
-    /// It is *not* attached to the test result bundle by default:
-    /// `XCTAttachment`s live for the whole (multi-hour) session and never get a
-    /// chance to be pruned before the runner exits, so keeping every screenshot
-    /// would inflate the on-device result bundle (and iOS "System Data") without
-    /// bound. The HTTP response and the size-capped temp directory already cover
-    /// retrieval; set `ATTACH_SCREENSHOTS=1` to opt back in when debugging.
+    /// Set `ATTACH_SCREENSHOTS=1` to also attach to the `.xcresult` (debugging
+    /// only; attachments accumulate for the whole session and inflate system data).
     @discardableResult
     private func captureScreenshot(tag: String) -> Data {
         let screenshot = XCUIScreen.main.screenshot()
@@ -352,43 +301,11 @@ final class RemoteControlTest: XCTestCase {
         if Config.attachScreenshots {
             let attachment = XCTAttachment(screenshot: screenshot)
             attachment.name = tag
-            attachment.lifetime = .keepAlways
+            attachment.lifetime = .deleteOnSuccess
             add(attachment)
         }
 
-        let stamp = Int(Date().timeIntervalSince1970 * 1000)
-        let url = Config.screenshotsDirectory.appendingPathComponent("\(tag)-\(stamp).png")
-        try? data.write(to: url)
-        pruneDeviceScreenshots()
         return data
-    }
-
-    /// Enforces `Config.maxDeviceScreenshots` on the on-device screenshot
-    /// directory by deleting the oldest PNGs once the count exceeds the cap.
-    /// A cap of zero or less leaves the directory unbounded.
-    private func pruneDeviceScreenshots() {
-        let cap = Config.maxDeviceScreenshots
-        guard cap > 0 else { return }
-
-        let fm = FileManager.default
-        let dir = Config.screenshotsDirectory
-        guard let files = try? fm.contentsOfDirectory(
-            at: dir,
-            includingPropertiesForKeys: [.contentModificationDateKey],
-            options: [.skipsHiddenFiles]
-        ) else { return }
-
-        guard files.count > cap else { return }
-
-        let sorted = files.sorted { lhs, rhs in
-            let lhsDate = (try? lhs.resourceValues(forKeys: [.contentModificationDateKey]).contentModificationDate) ?? .distantPast
-            let rhsDate = (try? rhs.resourceValues(forKeys: [.contentModificationDateKey]).contentModificationDate) ?? .distantPast
-            return lhsDate < rhsDate
-        }
-
-        for url in sorted.prefix(files.count - cap) {
-            try? fm.removeItem(at: url)
-        }
     }
 
     // MARK: - swifter server
@@ -423,17 +340,6 @@ final class RemoteControlTest: XCTestCase {
         server["/api/screenshot"] = { [weak self] _ in
             guard let self else { return .internalServerError }
             return self.httpResponse(for: self.broker.submit(.screenshot))
-        }
-        server["/api/screenshot/start"] = { [weak self] request in
-            guard let self else { return .internalServerError }
-            let params = self.params(request)
-            let interval = params["interval"].flatMap(Double.init) ?? 1.0
-            let limit = params["limit"].flatMap(Int.init).flatMap { $0 > 0 ? $0 : nil }
-            return self.httpResponse(for: self.broker.submit(.startPeriodicScreenshots(interval: interval, limit: limit)))
-        }
-        server["/api/screenshot/stop"] = { [weak self] _ in
-            guard let self else { return .internalServerError }
-            return self.httpResponse(for: self.broker.submit(.stopPeriodicScreenshots))
         }
         server["/api/tap"] = { [weak self] request in
             guard let self else { return .internalServerError }
@@ -719,8 +625,6 @@ private final class Command {
         case terminate(bundleId: String)
         case screenshot
         case tap(x: Double, y: Double, bundleId: String?)
-        case startPeriodicScreenshots(interval: TimeInterval, limit: Int?)
-        case stopPeriodicScreenshots
         case startMeasuring(bundleId: String)
         case timedMeasuring(bundleId: String, seconds: TimeInterval)
         case stopMeasuring
@@ -828,14 +732,6 @@ private enum MeasuringState: String {
     case stopped
 }
 
-/// Mutable schedule for periodic screenshots, owned by the main thread.
-private struct PeriodicSchedule {
-    let interval: TimeInterval
-    let limit: Int?
-    var captured = 0
-    var nextFireDate = Date()
-}
-
 // MARK: - Configuration
 
 private enum Config {
@@ -854,22 +750,9 @@ private enum Config {
     /// foreground, so a short window suffices; polling stops afterward.
     static var permissionWatchWindow: TimeInterval { env("PERMISSION_WATCH_WINDOW").flatMap(TimeInterval.init) ?? 5 * 60 }
 
-    static var screenshotsDirectory: URL {
-        let dir = FileManager.default.temporaryDirectory.appendingPathComponent("RemoteControlScreenshots", isDirectory: true)
-        try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
-        return dir
-    }
-
-    /// Upper bound on how many PNGs the on-device screenshot directory keeps;
-    /// older files past this count are pruned after each capture. A value of
-    /// zero or less disables the cap. Override with `MAX_DEVICE_SCREENSHOTS`.
-    static var maxDeviceScreenshots: Int { env("MAX_DEVICE_SCREENSHOTS").flatMap(Int.init) ?? 200 }
-
-    /// Whether captured screenshots are also attached to the test result
-    /// bundle. Attachments are `keepAlways` and persist for the whole session,
-    /// so they accumulate without bound over a multi-hour run and are redundant
-    /// with the HTTP response and the size-capped temp directory. Off by
-    /// default; enable with `ATTACH_SCREENSHOTS=1` for debugging.
+    /// Whether captured screenshots are also attached to the test result bundle.
+    /// Attachments accumulate for the whole session and inflate iOS "System
+    /// Data"; off by default. Enable with `ATTACH_SCREENSHOTS=1` for debugging.
     static var attachScreenshots: Bool {
         switch env("ATTACH_SCREENSHOTS")?.lowercased() {
         case "1", "true", "yes": return true
