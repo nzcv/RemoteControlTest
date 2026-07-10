@@ -13,6 +13,15 @@ DERIVED_DATA_PATH="${DERIVED_DATA_PATH:-$SCRIPT_DIR/build/DerivedData-RemoteCont
 ONLY_TESTING="${ONLY_TESTING:-RemoteControlTest/RemoteControlTest/testRemoteControl}"
 DEVICE_UDID="${DEVICE_UDID:-00008101-00161DAE14B8001E}"
 SERVER_PORT="${SERVER_PORT:-18200}"
+DEVICE_IP="${DEVICE_IP:-}"
+MAX_SESSION_SECONDS="${MAX_SESSION_SECONDS:-3600}"
+MAX_MEASUREMENT_SECONDS="${MAX_MEASUREMENT_SECONDS:-60}"
+MAX_MEASUREMENTS_PER_SESSION="${MAX_MEASUREMENTS_PER_SESSION:-1}"
+PERMISSION_WATCH_INTERVAL="${PERMISSION_WATCH_INTERVAL:-1.5}"
+PERMISSION_WATCH_WINDOW="${PERMISSION_WATCH_WINDOW:-30}"
+PERMISSION_WATCH_POST_ACCEPT_SECONDS="${PERMISSION_WATCH_POST_ACCEPT_SECONDS:-5}"
+# Memgraphs are large. Opt in explicitly only for dedicated diagnostic runs.
+ENABLE_PERFORMANCE_TEST_DIAGNOSTICS="${ENABLE_PERFORMANCE_TEST_DIAGNOSTICS:-NO}"
 # Reuse an existing .xctestrun and skip the build-for-testing step when set.
 SKIP_BUILD="${SKIP_BUILD:-0}"
 
@@ -68,14 +77,48 @@ for env_path in \
   ":TestConfigurations:0:TestTargets:0:EnvironmentVariables" \
   ":TestConfigurations:0:TestTargets:0:TestingEnvironmentVariables"; do
   set_xctestrun_env_var "$env_path" "SERVER_PORT" "$SERVER_PORT"
+  set_xctestrun_env_var "$env_path" "MAX_SESSION_SECONDS" "$MAX_SESSION_SECONDS"
+  set_xctestrun_env_var "$env_path" "MAX_MEASUREMENT_SECONDS" "$MAX_MEASUREMENT_SECONDS"
+  set_xctestrun_env_var "$env_path" "MAX_MEASUREMENTS_PER_SESSION" "$MAX_MEASUREMENTS_PER_SESSION"
+  set_xctestrun_env_var "$env_path" "PERMISSION_WATCH_INTERVAL" "$PERMISSION_WATCH_INTERVAL"
+  set_xctestrun_env_var "$env_path" "PERMISSION_WATCH_WINDOW" "$PERMISSION_WATCH_WINDOW"
+  set_xctestrun_env_var "$env_path" "PERMISSION_WATCH_POST_ACCEPT_SECONDS" "$PERMISSION_WATCH_POST_ACCEPT_SECONDS"
 done
+
+TARGET_PATH=":TestConfigurations:0:TestTargets:0"
+"$PLIST_BUDDY" -c "Set $TARGET_PATH:SystemAttachmentLifetime keepNever" "$XCTESTRUN_PATH" >/dev/null 2>&1 ||
+  "$PLIST_BUDDY" -c "Add $TARGET_PATH:SystemAttachmentLifetime string keepNever" "$XCTESTRUN_PATH"
 
 echo "Launching $ONLY_TESTING on $DESTINATION"
 echo "  SERVER_PORT=$SERVER_PORT"
+echo "  MAX_SESSION_SECONDS=$MAX_SESSION_SECONDS"
+echo "  MAX_MEASUREMENT_SECONDS=$MAX_MEASUREMENT_SECONDS"
+echo "  MAX_MEASUREMENTS_PER_SESSION=$MAX_MEASUREMENTS_PER_SESSION"
+echo "  ENABLE_PERFORMANCE_TEST_DIAGNOSTICS=$ENABLE_PERFORMANCE_TEST_DIAGNOSTICS"
 echo "Control the runner over http://<device-ip>:$SERVER_PORT (e.g. /api/health)."
 
-exec xcodebuild \
+xcodebuild \
   -xctestrun "$XCTESTRUN_PATH" \
   -destination "$DESTINATION" \
   test-without-building \
-  -only-testing:"$ONLY_TESTING"
+  -enablePerformanceTestsDiagnostics "$ENABLE_PERFORMANCE_TEST_DIAGNOSTICS" \
+  -collect-test-diagnostics never \
+  -only-testing:"$ONLY_TESTING" &
+XCODEBUILD_PID=$!
+
+graceful_shutdown() {
+  if [[ -n "$DEVICE_IP" ]]; then
+    curl --fail --silent --show-error --max-time 3 \
+      "http://$DEVICE_IP:$SERVER_PORT/api/exit" >/dev/null 2>&1 || true
+    sleep 1
+  fi
+  kill -TERM "$XCODEBUILD_PID" >/dev/null 2>&1 || true
+}
+
+trap graceful_shutdown INT TERM
+set +e
+wait "$XCODEBUILD_PID"
+STATUS=$?
+set -e
+trap - INT TERM
+exit "$STATUS"

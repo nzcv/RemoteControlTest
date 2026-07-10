@@ -24,8 +24,8 @@ Parameters may be passed as query string values or in a JSON request body.
 | GET | `/api/terminate/{bundleId}` | `bundleId` (path) | Terminate an app, with `bundleId` as a path segment |
 | GET | `/api/screenshot` | – | Capture one screenshot, returned as `image/png` |
 | any | `/api/tap` | `x`, `y` (normalized `[0, 1]`), `bundleId` (optional) | Tap a normalized point (`0,0` top-left, `1,1` bottom-right). Pass the foreground `bundleId` so the offset is anchored to that app's orientation (required for correct landscape taps; defaults to SpringBoard's portrait frame otherwise) |
-| GET | `/api/measuring/start` | `bundleId` | Open an `XCTMemoryMetric` window on an app; other commands keep working while it is open |
-| GET | `/api/measuring/period/{seconds}` | `seconds` (path), `bundleId` | Open a measured window that auto-closes after `seconds` |
+| GET | `/api/measuring/start` | `bundleId` | Open a bounded `XCTMemoryMetric` window on an app; other commands keep working while it is open |
+| GET | `/api/measuring/period/{seconds}` | `seconds` (path), `bundleId` | Open a measured window that auto-closes after `seconds` (clamped to `MAX_MEASUREMENT_SECONDS`) |
 | GET | `/api/measuring/stop` | – | Close the measured window (footprint is harvested into the `.xcresult`) |
 | GET | `/api/measuring/status` | – | Report the measuring `state`: `idle`, `started`, or `stopped` |
 | GET | `/api/exit` | – | Quit the runner |
@@ -42,27 +42,44 @@ HTTP only — nothing is written to the device (same as WebDriverAgent).
 | Variable | Default | Purpose |
 | -------- | ------- | ------- |
 | `SERVER_PORT` | `18200` | Port the swifter server binds |
-| `MAX_SESSION_SECONDS` | `21600` | Hard cap on how long the runner stays alive |
+| `MAX_SESSION_SECONDS` | `3600` | Hard cap on how long the runner stays alive |
+| `MAX_MEASUREMENT_SECONDS` | `60` | Hard cap for one memory-measurement window |
+| `MAX_MEASUREMENTS_PER_SESSION` | `1` | Maximum measurement windows before a fresh XCTest session is required |
+| `PERMISSION_WATCH_INTERVAL` | `1.5` | Seconds between SpringBoard permission checks |
+| `PERMISSION_WATCH_WINDOW` | `30` | Maximum permission-watch duration after launch/activate |
+| `PERMISSION_WATCH_POST_ACCEPT_SECONDS` | `5` | Remaining grace period after accepting a prompt |
+
+`launch_with_xcodebuild.sh` also accepts
+`ENABLE_PERFORMANCE_TEST_DIAGNOSTICS=YES`. It defaults to `NO` because enabling
+performance diagnostics may generate large pre/post memgraphs. Both launch
+scripts accept `DEVICE_IP`; when supplied, Ctrl-C first calls `/api/exit` so
+XCTest can finish normally before the launcher is terminated.
 
 ### Reducing iOS "System Data"
 
 The runner can accumulate on-device storage when misconfigured. To keep usage
 light (comparable to WebDriverAgent):
 
-1. Use on-demand `/api/screenshot` only.
-2. Use `/api/measuring/*` sparingly; each `XCTMemoryMetric` snapshot (memgraph)
-   can be tens to hundreds of MB in the `.xcresult`.
-3. Call `/api/exit` when done so XCTest can tear down cleanly.
-4. Periodically clear test data in Xcode → Devices, or reboot the device.
+1. Automatic XCTest screenshots and diagnostic recordings are disabled at
+   runner startup; on-demand screenshots remain HTTP-only.
+2. Keep `ENABLE_PERFORMANCE_TEST_DIAGNOSTICS=NO` for normal remote-control
+   sessions. Enable it only for a dedicated memory-diagnostics run.
+3. Use a fresh XCTest session after the configured measurement limit.
+4. Call `/api/exit` when done so XCTest can tear down cleanly.
+5. Periodically clear test data in Xcode → Devices, or reboot the device.
 
 ## Running
 
 ```bash
 # Build + run on a connected device via xcodebuild (resolves swifter via SPM).
-DEVICE_UDID=<udid> ./launch_with_xcodebuild.sh
+DEVICE_UDID=<udid> DEVICE_IP=<device-ip> ./launch_with_xcodebuild.sh
 
 # Or, after building once, launch the installed runner via go-ios.
-./launch.sh
+DEVICE_UDID=<udid> DEVICE_IP=<device-ip> ./launch.sh
+
+# Dedicated memgraph run (large XCTest attachments are expected).
+ENABLE_PERFORMANCE_TEST_DIAGNOSTICS=YES \
+  DEVICE_UDID=<udid> DEVICE_IP=<device-ip> ./launch_with_xcodebuild.sh
 ```
 
 Example client calls:

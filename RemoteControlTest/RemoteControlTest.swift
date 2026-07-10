@@ -36,8 +36,8 @@ final class RemoteControlTest: XCTestCase {
     /// window on. Armed by a `startMeasuring` command, consumed on the main
     /// test thread (XCTest's `measure` may only run there).
     private var pendingMeasureApp: XCUIApplication?
-    /// Optional auto-close duration (seconds) for the pending window; `nil`
-    /// leaves it open until an explicit `stopMeasuring`.
+    /// Auto-close duration (seconds) for the pending window. Every measurement
+    /// is capped by `Config.maxMeasurementSeconds`.
     private var pendingMeasureDuration: TimeInterval?
     /// True while a `measure` window is open and draining the broker itself.
     private var measuringActive = false
@@ -47,6 +47,9 @@ final class RemoteControlTest: XCTestCase {
     private var measuringState = MeasuringState.idle
     /// Set by a `stopMeasuring` command to close the open window.
     private var measureStopRequested = false
+    /// Number of measurement windows opened in this XCTest session. Memory
+    /// diagnostics can create large test attachments, so the count is bounded.
+    private var measurementCount = 0
 
     /// Next due time for the system-permission watcher that auto-accepts
     /// prompts a foregrounded app (e.g. a freshly launched game) raises —
@@ -55,13 +58,22 @@ final class RemoteControlTest: XCTestCase {
     private var nextPermissionCheck = Date()
     /// The watcher only runs until this deadline. Permission prompts arrive
     /// shortly after an app comes to the foreground, so rather than poll
-    /// SpringBoard for the whole (multi-hour) session we open a bounded window
+    /// SpringBoard for the whole long-lived session we open a bounded window
     /// on each launch/activate, then stop. `distantPast` keeps it off until the
     /// first app is foregrounded.
     private var permissionWatchUntil = Date.distantPast
 
     override func setUpWithError() throws {
-        continueAfterFailure = false
+        // Match WDA's storage-conservative XCTest defaults. These switches only
+        // affect XCTest's automatic diagnostics; the explicit /api/screenshot
+        // endpoint continues to return image bytes normally.
+        let defaults = UserDefaults.standard
+        defaults.set(true, forKey: "DisableScreenshots")
+        defaults.set(true, forKey: "DisableDiagnosticScreenRecordings")
+
+        // A command-level XCTest issue should not immediately tear down and
+        // relaunch this long-lived agent, which would generate more diagnostics.
+        continueAfterFailure = true
         try startServer()
     }
 
@@ -88,7 +100,7 @@ final class RemoteControlTest: XCTestCase {
             }
             drivePermissionPrompts()
             if let app = pendingMeasureApp {
-                let duration = pendingMeasureDuration
+                let duration = pendingMeasureDuration ?? Config.maxMeasurementSeconds
                 pendingMeasureApp = nil
                 pendingMeasureDuration = nil
                 runMeasurement(app: app, sessionDeadline: deadline, duration: duration)
@@ -108,6 +120,7 @@ final class RemoteControlTest: XCTestCase {
     /// `drivePermissionPrompts()` stops polling SpringBoard. Armed on each
     /// launch/activate, since prompts only appear once an app is foregrounded.
     private func armPermissionWatch() {
+        nextPermissionCheck = Date()
         permissionWatchUntil = Date().addingTimeInterval(Config.permissionWatchWindow)
     }
 
@@ -119,9 +132,8 @@ final class RemoteControlTest: XCTestCase {
     /// measurement is live.
     ///
     /// The window closes on the first of: an explicit `stopMeasuring`, the
-    /// optional fixed `duration` elapsing, the session deadline, or an exit
-    /// request.
-    private func runMeasurement(app: XCUIApplication, sessionDeadline: Date, duration: TimeInterval?) {
+    /// bounded `duration` elapsing, the session deadline, or an exit request.
+    private func runMeasurement(app: XCUIApplication, sessionDeadline: Date, duration: TimeInterval) {
         let options = XCTMeasureOptions()
         options.invocationOptions = [.manuallyStart, .manuallyStop]
         options.iterationCount = 1
@@ -136,9 +148,9 @@ final class RemoteControlTest: XCTestCase {
 
         measure(metrics: [XCTMemoryMetric(application: app)], options: options) {
             startMeasuring()
-            let windowDeadline = duration.map { Date().addingTimeInterval($0) }
+            let windowDeadline = Date().addingTimeInterval(duration)
             while !measureStopRequested, !broker.shouldExit, Date() < sessionDeadline {
-                if let windowDeadline, Date() >= windowDeadline { break }
+                if Date() >= windowDeadline { break }
                 if let command = broker.next(timeout: 0.2) {
                     execute(command)
                 }
@@ -214,37 +226,56 @@ final class RemoteControlTest: XCTestCase {
             ]))
 
         case .startMeasuring(let bundleId):
-            if measuringActive {
+            if measuringActive || pendingMeasureApp != nil {
                 command.finish(.json([
                     "status": "error",
                     "action": "startMeasuring",
                     "reason": "a measurement is already in progress",
                 ]))
+            } else if measurementCount >= Config.maxMeasurementsPerSession {
+                command.finish(.json([
+                    "status": "error",
+                    "action": "startMeasuring",
+                    "reason": "measurement limit reached for this session",
+                    "limit": Config.maxMeasurementsPerSession,
+                ]))
             } else {
+                measurementCount += 1
                 pendingMeasureApp = XCUIApplication(bundleIdentifier: bundleId)
-                pendingMeasureDuration = nil
+                pendingMeasureDuration = Config.maxMeasurementSeconds
                 command.finish(.json([
                     "status": "ok",
                     "action": "startMeasuring",
                     "bundleId": bundleId,
+                    "maxSeconds": Config.maxMeasurementSeconds,
                 ]))
             }
 
         case .timedMeasuring(let bundleId, let seconds):
-            if measuringActive {
+            if measuringActive || pendingMeasureApp != nil {
                 command.finish(.json([
                     "status": "error",
                     "action": "dtMeasuring",
                     "reason": "a measurement is already in progress",
                 ]))
+            } else if measurementCount >= Config.maxMeasurementsPerSession {
+                command.finish(.json([
+                    "status": "error",
+                    "action": "dtMeasuring",
+                    "reason": "measurement limit reached for this session",
+                    "limit": Config.maxMeasurementsPerSession,
+                ]))
             } else {
+                let boundedSeconds = min(seconds, Config.maxMeasurementSeconds)
+                measurementCount += 1
                 pendingMeasureApp = XCUIApplication(bundleIdentifier: bundleId)
-                pendingMeasureDuration = seconds
+                pendingMeasureDuration = boundedSeconds
                 command.finish(.json([
                     "status": "ok",
                     "action": "dtMeasuring",
                     "bundleId": bundleId,
-                    "seconds": seconds,
+                    "seconds": boundedSeconds,
+                    "requestedSeconds": seconds,
                 ]))
             }
 
@@ -284,7 +315,14 @@ final class RemoteControlTest: XCTestCase {
         guard Date() < permissionWatchUntil else { return }
         guard Date() >= nextPermissionCheck else { return }
         nextPermissionCheck = Date().addingTimeInterval(Config.permissionWatchInterval)
-        dismissPermissionAlertIfPresent(waitTimeout: 0)
+        if dismissPermissionAlertIfPresent(waitTimeout: 0) {
+            // Leave a short grace period for a second prompt that may follow,
+            // rather than continuing the full watch window.
+            permissionWatchUntil = min(
+                permissionWatchUntil,
+                Date().addingTimeInterval(Config.permissionWatchPostAcceptWindow)
+            )
+        }
     }
 
     /// Captures a full-screen PNG and returns it to the caller (served directly
@@ -725,17 +763,35 @@ private enum Config {
     static var serverPort: in_port_t { env("SERVER_PORT").flatMap { in_port_t($0) } ?? 18100 }
     static var testBundleIdentifier: String { env("TEST_BUNDLE_IDENTIFIER") ?? "com.idevice.RemoteControlTest" }
     static var runnerBundleIdentifier: String { env("RUNNER_BUNDLE_IDENTIFIER") ?? testBundleIdentifier + ".xctrunner" }
-    static var maxSessionSeconds: TimeInterval { env("MAX_SESSION_SECONDS").flatMap(TimeInterval.init) ?? 6 * 60 * 60 }
+    static var maxSessionSeconds: TimeInterval { positiveTimeInterval("MAX_SESSION_SECONDS") ?? 60 * 60 }
+
+    /// Hard cap for one XCTMemoryMetric window. A client may request a shorter
+    /// period, but never a longer one.
+    static var maxMeasurementSeconds: TimeInterval { positiveTimeInterval("MAX_MEASUREMENT_SECONDS") ?? 60 }
+
+    /// Large memory diagnostics scale with measurement count, so a fresh XCTest
+    /// session is required after this many windows.
+    static var maxMeasurementsPerSession: Int {
+        guard let value = env("MAX_MEASUREMENTS_PER_SESSION").flatMap(Int.init), value > 0 else {
+            return 1
+        }
+        return value
+    }
 
     /// How often the in-loop watcher scans SpringBoard for a system-permission
     /// alert to auto-accept. Lower is more responsive but queries the UI tree
     /// more often.
-    static var permissionWatchInterval: TimeInterval { env("PERMISSION_WATCH_INTERVAL").flatMap(TimeInterval.init) ?? 1.5 }
+    static var permissionWatchInterval: TimeInterval { positiveTimeInterval("PERMISSION_WATCH_INTERVAL") ?? 1.5 }
 
     /// How long the permission watcher keeps polling after it is armed (each
     /// launch/activate). Prompts arrive soon after an app comes to the
     /// foreground, so a short window suffices; polling stops afterward.
-    static var permissionWatchWindow: TimeInterval { env("PERMISSION_WATCH_WINDOW").flatMap(TimeInterval.init) ?? 5 * 60 }
+    static var permissionWatchWindow: TimeInterval { positiveTimeInterval("PERMISSION_WATCH_WINDOW") ?? 30 }
+
+    /// After accepting one prompt, keep watching briefly for a chained prompt.
+    static var permissionWatchPostAcceptWindow: TimeInterval {
+        positiveTimeInterval("PERMISSION_WATCH_POST_ACCEPT_SECONDS") ?? 5
+    }
 
     /// Whether the one-time Local Network privacy prompt has already been
     /// accepted. iOS persists the system permission per app, so caching our own
@@ -748,5 +804,10 @@ private enum Config {
 
     private static func env(_ key: String) -> String? {
         ProcessInfo.processInfo.environment[key]
+    }
+
+    private static func positiveTimeInterval(_ key: String) -> TimeInterval? {
+        guard let value = env(key).flatMap(TimeInterval.init), value > 0 else { return nil }
+        return value
     }
 }
