@@ -168,6 +168,13 @@ final class RemoteControlTest: XCTestCase {
             armPermissionWatch()
             let app = XCUIApplication(bundleIdentifier: bundleId)
             if app.state != .notRunning { app.terminate() }
+            // When the run was launched in memgraph mode, `run.rs` injects the
+            // `APP_STACK_LOGGING` signal into the runner's environment. Forward it
+            // to the target app's cold-launch environment so its diagnostic memory
+            // graph carries allocation backtraces.
+            if Config.appStackLogging {
+                app.launchEnvironment["MallocStackLogging"] = "1"
+            }
             app.launch()
             let ok = app.wait(for: .runningForeground, timeout: 30)
             command.finish(.json([
@@ -801,6 +808,11 @@ private enum Config {
         get { UserDefaults.standard.bool(forKey: localNetworkGrantedKey) }
         set { UserDefaults.standard.set(newValue, forKey: localNetworkGrantedKey) }
     }
+
+    /// Signal injected into the runner's environment by `run.rs` when a run is
+    /// launched in memgraph mode; tells `.launch` to cold-start the target app
+    /// with `MallocStackLogging` so its memory graph carries backtraces.
+    static var appStackLogging: Bool { env("APP_STACK_LOGGING") == "1" }
 
     private static func env(_ key: String) -> String? {
         ProcessInfo.processInfo.environment[key]
