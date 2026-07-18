@@ -41,10 +41,6 @@ final class RemoteControlTest: XCTestCase {
     private var pendingMeasureDuration: TimeInterval?
     /// True while a `measure` window is open and draining the broker itself.
     private var measuringActive = false
-    /// Coarse measuring lifecycle reported by `/api/measuring/status`:
-    /// `idle` before any measurement, `started` while a window is open,
-    /// `stopped` after one closes.
-    private var measuringState = MeasuringState.idle
     /// Set by a `stopMeasuring` command to close the open window.
     private var measureStopRequested = false
     /// Number of measurement windows opened in this XCTest session. Memory
@@ -139,11 +135,11 @@ final class RemoteControlTest: XCTestCase {
         options.iterationCount = 1
 
         measuringActive = true
-        measuringState = .started
+        broker.setMeasuringState(.started)
         measureStopRequested = false
         defer {
             measuringActive = false
-            measuringState = .stopped
+            broker.setMeasuringState(.stopped)
         }
 
         measure(metrics: [XCTMemoryMetric(application: app)], options: options) {
@@ -286,13 +282,6 @@ final class RemoteControlTest: XCTestCase {
                 ]))
             }
 
-        case .measuringStatus:
-            command.finish(.json([
-                "status": "ok",
-                "action": "measuringStatus",
-                "state": measuringState.rawValue,
-            ]))
-
         case .stopMeasuring:
             if measuringActive {
                 measureStopRequested = true
@@ -405,7 +394,11 @@ final class RemoteControlTest: XCTestCase {
         }
         server.GET["/api/measuring/status"] = { [weak self] _ in
             guard let self else { return .internalServerError }
-            return self.httpResponse(for: self.broker.submit(.measuringStatus))
+            return self.jsonResponse([
+                "status": "ok",
+                "action": "measuringStatus",
+                "state": self.broker.measuringState.rawValue,
+            ])
         }
         server["/api/exit"] = { [weak self] _ in
             guard let self else { return .internalServerError }
@@ -660,7 +653,6 @@ private final class Command {
         case startMeasuring(bundleId: String)
         case timedMeasuring(bundleId: String, seconds: TimeInterval)
         case stopMeasuring
-        case measuringStatus
         case exit
     }
 
@@ -705,6 +697,7 @@ private final class CommandBroker {
     private var queue: [Command] = []
     private var exitRequested = false
     private var phase: Phase = .notStarted
+    private var measuring: MeasuringState = .idle
 
     var shouldExit: Bool {
         condition.lock(); defer { condition.unlock() }
@@ -714,6 +707,20 @@ private final class CommandBroker {
     var currentPhase: Phase {
         condition.lock(); defer { condition.unlock() }
         return phase
+    }
+
+    /// Coarse measuring lifecycle, read directly by `/api/measuring/status`.
+    /// Kept off the command queue so a status poll never blocks behind the
+    /// main thread while it is finalizing a long memgraph capture.
+    var measuringState: MeasuringState {
+        condition.lock(); defer { condition.unlock() }
+        return measuring
+    }
+
+    func setMeasuringState(_ value: MeasuringState) {
+        condition.lock()
+        measuring = value
+        condition.unlock()
     }
 
     func markInitializing() {
